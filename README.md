@@ -93,9 +93,11 @@ reverse-engineered and verified against Claude Code 2.1.212; see
 
 - Pinned to **rustc 1.75 / edition 2021**; `Cargo.lock` holds MSRV-compatible
   dependency versions (do not add edition-2024 crates).
-- `cargo build --workspace` · `cargo test --workspace` (41 tests, incl. a
+- `cargo build --workspace` · `cargo test --workspace` (42 tests, incl. a
   headless end-to-end run driven by mock agents — never a live `claude`).
 - `fmt`/`clippy` run in CI.
+- `scripts/tty-smoke.py` drives the interactive TUI in a real pseudo-terminal
+  (via `pyte`) — a way to exercise the interactive path with no terminal attached.
 
 ## Status
 
