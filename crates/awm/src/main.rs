@@ -174,6 +174,11 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
                                 LayoutMode::Triage
                             };
                         }
+                        KeyCode::Char('x') if ctrl => {
+                            if let Some(f) = engine.registry().focus() {
+                                engine.kill(f);
+                            }
+                        }
                         _ => {
                             if let Some(action) = map_key(key) {
                                 if matches!(action, Action::SpawnPrompt) {

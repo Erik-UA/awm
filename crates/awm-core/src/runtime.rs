@@ -27,6 +27,7 @@ pub struct Engine {
     tx: Sender<CoreEvent>,
     rx: Receiver<CoreEvent>,
     answerers: HashMap<AgentId, Answerer>,
+    pids: HashMap<AgentId, u32>,
     readers: Vec<JoinHandle<()>>,
 }
 
@@ -44,6 +45,7 @@ impl Engine {
             tx,
             rx,
             answerers: HashMap::new(),
+            pids: HashMap::new(),
             readers: Vec::new(),
         }
     }
@@ -83,6 +85,9 @@ impl Engine {
             runner.send_prompt(&p)?;
         }
         self.answerers.insert(id, runner.answerer());
+        if let Some(pid) = runner.pid() {
+            self.pids.insert(id, pid);
+        }
 
         let tx = self.tx.clone();
         let handle = std::thread::spawn(move || {
@@ -150,6 +155,19 @@ impl Engine {
         self.reg
             .apply_event(id, &AgentEvent::ApprovalResolved { approved });
         Ok(())
+    }
+
+    /// Terminate an agent's process. Its reader thread then sees EOF and the
+    /// agent transitions to Failed (via the EOF safety net). No-op if unknown.
+    pub fn kill(&mut self, id: AgentId) {
+        if let Some(pid) = self.pids.remove(&id) {
+            // std has no signal API; shell out to `kill` (dependency-free).
+            let _ = std::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .status();
+        }
+        self.answerers.remove(&id);
     }
 
     /// Join all reader threads (call once agents are terminal / on shutdown).

@@ -50,8 +50,11 @@ cargo run -p awm            # spawns three mock agents
 | `Ctrl+m` | toggle monocle (full-screen focus) |
 | `Ctrl+t` | toggle triage (only blocked agents, oldest first) |
 | `Ctrl+1..9` | toggle a tag on the focused agent |
-| `Ctrl+p` | spawn another agent |
+| `Ctrl+p` | spawn an agent — type a prompt, `Enter` to launch, `Esc` to cancel |
+| `Ctrl+x` | kill the focused agent |
 | `q` | quit |
+
+The focused agent is marked with `▸`.
 
 ## How it works
 

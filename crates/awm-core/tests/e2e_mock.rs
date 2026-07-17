@@ -145,6 +145,32 @@ fn noisy_stream_still_reaches_done() {
 }
 
 #[test]
+fn killing_a_blocked_agent_makes_it_terminal() {
+    let mut engine = Engine::new();
+    let id = engine
+        .spawn(mock_spec(), "victim", Tags::empty(), None, false)
+        .unwrap();
+
+    // Let it reach the gate (it then blocks forever waiting on stdin).
+    assert!(pump_until(&mut engine, |e| e
+        .registry()
+        .pending_request_id(id)
+        .is_some()));
+
+    engine.kill(id);
+
+    let terminal = pump_until(&mut engine, |e| {
+        e.registry()
+            .record(id)
+            .map(|r| r.state.is_terminal())
+            .unwrap_or(false)
+    });
+    assert!(terminal, "a killed agent must become terminal, not hang");
+    assert_eq!(engine.registry().record(id).unwrap().state, AgentState::Failed);
+    engine.join();
+}
+
+#[test]
 fn denying_makes_the_agent_fail() {
     let mut engine = Engine::new();
     let id = engine.spawn(mock_spec(), "d", Tags::empty(), None, false).unwrap();

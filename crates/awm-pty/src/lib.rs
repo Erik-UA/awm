@@ -302,6 +302,12 @@ impl StreamJsonRunner {
         self.answerer.answer(request_id, decision)
     }
 
+    /// The OS process id of the agent, if still running. Lets the engine signal
+    /// the child from another thread (the runner itself lives in a reader thread).
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// Block until the agent exits and return its status code.
     pub fn wait(&mut self) -> std::io::Result<i32> {
         let StreamJsonRunner { rt, child, .. } = self;
