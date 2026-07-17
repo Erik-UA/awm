@@ -1,0 +1,31 @@
+name: Release
+
+# Build a release binary and attach it to the GitHub Release when a v* tag is
+# pushed. (A cargo-dist config can replace this later for multi-platform builds.)
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.75
+        run: |
+          rustup toolchain install 1.75.0
+          rustup default 1.75.0
+      - name: Build
+        run: cargo build --release -p awm
+      - name: Package
+        run: |
+          tar -C target/release -czf awm-${{ github.ref_name }}-linux-x86_64.tar.gz awm
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: awm-*.tar.gz
+          generate_release_notes: true
