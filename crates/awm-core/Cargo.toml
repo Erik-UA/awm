@@ -4,8 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Event bus, agent registry, and layout engine for awm (integration). Phase 3."
+description = "Event bus, agent registry, and layout engine for awm (Phase 3 integration)."
 
 [dependencies]
 awm-proto = { workspace = true }
-tokio = { workspace = true }
+awm-pty = { workspace = true }
+awm-parser = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

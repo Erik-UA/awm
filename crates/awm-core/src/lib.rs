@@ -1,8 +1,14 @@
-//! Integration crate — event bus, agent registry, layout engine. **Stub for
-//! Phase 3.** Intentionally minimal: nothing here is implemented until the
-//! contract is frozen and the tracks are green.
+//! Integration crate — the agent registry, the layout engine, and the runtime
+//! that ties `awm-pty` (agent I/O), `awm-parser` (events), and `awm-proto` (the
+//! contract) together. The `awm` binary drives an [`Engine`] and renders its
+//! [`Registry`] via `awm-tui`.
 
 #![forbid(unsafe_code)]
 
-/// Marker so the crate compiles and the workspace links; replaced in Phase 3.
-pub const PHASE: &str = "phase-3-not-started";
+pub mod layout;
+pub mod registry;
+pub mod runtime;
+
+pub use layout::{plan_layout, LayoutMode};
+pub use registry::{AgentRecord, Registry};
+pub use runtime::{CoreEvent, Engine};
