@@ -9,3 +9,6 @@ description = "PTY session management for awm (Track A). Phase 2."
 [dependencies]
 awm-proto = { workspace = true }
 portable-pty = { workspace = true }
+# Agent-runner mode: spawn the agent via piped stdio and act as the permission
+# controller over the stream-json control channel.
+tokio = { workspace = true }

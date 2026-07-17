@@ -1,19 +1,30 @@
-## Task: awm-pty — PTY session management
+## Task: awm-pty — PTY + agent runner (control channel)
 
-**Context.** Implement the PTY layer behind the frozen API in
-`crates/awm-pty/src/lib.rs` (`CommandSpec`, `PtySession`). Use `portable-pty`
-(already a dep). No proto types change. See `awm-proto` for the wider contract.
+**Context.** Implement two things in `crates/awm-pty/src/lib.rs`:
+1. **PTY mode** (`CommandSpec`, `PtySession`) — spawn/kill/resize a child in a
+   PTY with a bounded output ring buffer. Used for the manual `e` (attach) case.
+2. **Agent-runner mode** (`StreamJsonRunner`, `Decision`) — the primary path for
+   the killer feature. Spawn the agent via **piped stdio** in stream-json mode,
+   expose raw stdout bytes to the parser (Track B), and act as the **permission
+   controller**: on a `can_use_tool` gate, write a `control_response` line.
 
-**Scope.** Only `crates/awm-pty/`. Do not touch `awm-proto` or any other crate.
+Approval is a control-channel concern, ground-truthed in `docs/approval-findings.md`
+(raw shapes in `docs/canusetool-raw.json`). The allow/deny *decision* and layout
+wiring are Phase 3 — you only implement the transport/write-path here.
+
+**Scope.** Only `crates/awm-pty/`. Do not touch `awm-proto` (frozen) or other crates.
 
 **Acceptance (make green):**
-- `crates/awm-pty/tests/spawn.rs` — `spawn_echo_reads_output_and_exits_zero`.
-- Implement: spawn cmd/args/cwd/env in a PTY; a bounded ring buffer keeping the
-  last `ring_lines` lines (`tail(n)`); `resize(rows, cols)`; `wait() -> exit code`;
-  `kill()`. Add your own unit tests for resize and ring-buffer eviction.
+- `tests/spawn.rs` — `spawn`/`tail`/`resize`/`wait`/`kill` on a PTY.
+- `tests/control_channel.rs` — drives `fixtures/mock-agent.py` (NOT live claude):
+  `StreamJsonRunner::spawn`, `read()` raw bytes (empty vec = EOF), `answer(request_id,
+  Decision::Allow)` must write the control_response the mock expects
+  (`{"type":"control_response","response":{"subtype":"success","request_id":<id>,
+  "response":{"behavior":"allow","updatedInput":{...}}}}`), so the agent proceeds
+  and exits 0. Add unit tests for ring-buffer eviction and a `Decision::Deny` path.
 
 **Don't:** touch `awm-proto`; spawn a live `claude`; add global mutable state.
 
-**Notes.** Keep MSRV 1.75 / edition 2021. If a new dep bumps MSRV, pin it
-(`cargo update <crate> --precise <ver>`) and note it. `cargo build && cargo test`
-before every commit; conventional commits, one step per commit.
+**Notes.** MSRV 1.75 / edition 2021; `tokio` (process/io) is available. If a dep
+bumps MSRV, pin it (`cargo update <crate> --precise <ver>`). `cargo build &&
+cargo test` before every commit; conventional commits, one step per commit.
