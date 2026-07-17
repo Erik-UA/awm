@@ -20,7 +20,9 @@ status bar without hunting for it.
 ```
 
 Press `y` to approve the master agent, `n` to deny — the response goes back over
-the agent's control channel and it resumes. No entering the session.
+the agent's control channel and it resumes. No entering the session. Press `i` to
+send a follow-up message to the focused agent and watch its reply in the window
+(a live, multi-turn conversation over stream-json input).
 
 ## Quick start
 
@@ -44,6 +46,7 @@ cargo run -p awm            # spawns three mock agents
 | Key | Action |
 |-----|--------|
 | `y` / `n` | approve / deny the agent in the master zone |
+| `i` | message the focused agent — type, `Enter` sends, `Esc` cancels |
 | `e` | expand the pending request (monocle) |
 | `Ctrl+j` / `Ctrl+k` | move focus down / up |
 | `Ctrl+Enter` | back to tiling (focus in master) |
