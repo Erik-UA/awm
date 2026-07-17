@@ -37,36 +37,80 @@ impl<B: Backend> AwmTui<B> {
     }
 }
 
-impl<B: Backend> Renderer for AwmTui<B> {
-    fn render(&mut self, views: &[AgentView], layout: &LayoutCmd) -> std::io::Result<()> {
+impl<B: Backend> AwmTui<B> {
+    /// Draw a frame with an optional focus highlight and an optional bottom
+    /// input bar (the `Ctrl+p` spawn prompt). `render` from the [`Renderer`]
+    /// trait is this with both `None`.
+    pub fn draw(
+        &mut self,
+        views: &[AgentView],
+        layout: &LayoutCmd,
+        focus: Option<AgentId>,
+        prompt: Option<&str>,
+    ) -> std::io::Result<()> {
         self.terminal.draw(|frame| {
-            let area = frame.size();
-            match layout {
-                LayoutCmd::Monocle(id) => match find(views, *id) {
-                    Some(v) => draw_pane(frame, v, area),
-                    None => draw_empty(frame, area),
-                },
-                LayoutCmd::Triage(ids) => draw_triage(frame, views, ids, area),
-                // Both promote a single agent to the master zone; the rest of the
-                // roster falls into the side stack in roster order.
-                LayoutCmd::SetMaster(id) | LayoutCmd::Focus(id) => {
-                    let master = *id;
-                    let stack: Vec<AgentId> = views
-                        .iter()
-                        .map(|v| v.meta.id)
-                        .filter(|i| *i != master)
-                        .collect();
-                    draw_master_stack(frame, views, master, &stack, area);
+            let full = frame.size();
+            let area = match prompt {
+                Some(text) => {
+                    let rows = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(1), Constraint::Length(1)])
+                        .split(full);
+                    draw_prompt_bar(frame, text, rows[1]);
+                    rows[0]
                 }
-                // Treat the head of the stack as master, the tail as the stack.
-                LayoutCmd::Stack(ids) => match ids.split_first() {
-                    Some((first, rest)) => draw_master_stack(frame, views, *first, rest, area),
-                    None => draw_empty(frame, area),
-                },
-            }
+                None => full,
+            };
+            render_into(frame, views, layout, focus, area);
         })?;
         Ok(())
     }
+}
+
+impl<B: Backend> Renderer for AwmTui<B> {
+    fn render(&mut self, views: &[AgentView], layout: &LayoutCmd) -> std::io::Result<()> {
+        self.draw(views, layout, None, None)
+    }
+}
+
+/// Dispatch a layout command into `area`, optionally marking the focused agent.
+fn render_into(
+    frame: &mut Frame,
+    views: &[AgentView],
+    layout: &LayoutCmd,
+    focus: Option<AgentId>,
+    area: Rect,
+) {
+    match layout {
+        LayoutCmd::Monocle(id) => match find(views, *id) {
+            Some(v) => draw_pane(frame, v, focus == Some(v.meta.id), area),
+            None => draw_empty(frame, area),
+        },
+        LayoutCmd::Triage(ids) => draw_triage(frame, views, ids, focus, area),
+        // Both promote a single agent to the master zone; the rest of the roster
+        // falls into the side stack in roster order.
+        LayoutCmd::SetMaster(id) | LayoutCmd::Focus(id) => {
+            let master = *id;
+            let stack: Vec<AgentId> = views
+                .iter()
+                .map(|v| v.meta.id)
+                .filter(|i| *i != master)
+                .collect();
+            draw_master_stack(frame, views, master, &stack, focus, area);
+        }
+        // Treat the head of the stack as master, the tail as the stack.
+        LayoutCmd::Stack(ids) => match ids.split_first() {
+            Some((first, rest)) => draw_master_stack(frame, views, *first, rest, focus, area),
+            None => draw_empty(frame, area),
+        },
+    }
+}
+
+/// The bottom spawn-prompt input bar (shown while typing a `Ctrl+p` prompt).
+fn draw_prompt_bar(frame: &mut Frame, text: &str, area: Rect) {
+    let line = format!("spawn agent> {text}\u{2588}");
+    let style = Style::default().fg(Color::Black).bg(Color::Cyan);
+    frame.render_widget(Paragraph::new(line).style(style), area);
 }
 
 /// Find an agent view by id.
@@ -80,6 +124,7 @@ fn draw_master_stack(
     views: &[AgentView],
     master_id: AgentId,
     stack_ids: &[AgentId],
+    focus: Option<AgentId>,
     area: Rect,
 ) {
     let master = find(views, master_id);
@@ -88,7 +133,7 @@ fn draw_master_stack(
     // No side stack (or a single agent): the master fills the whole area.
     if stack.is_empty() {
         match master {
-            Some(m) => draw_pane(frame, m, area),
+            Some(m) => draw_pane(frame, m, focus == Some(m.meta.id), area),
             None => draw_empty(frame, area),
         }
         return;
@@ -100,52 +145,65 @@ fn draw_master_stack(
         .split(area);
 
     match master {
-        Some(m) => draw_pane(frame, m, cols[0]),
+        Some(m) => draw_pane(frame, m, focus == Some(m.meta.id), cols[0]),
         None => draw_empty(frame, cols[0]),
     }
-    draw_stack(frame, &stack, cols[1]);
+    draw_stack(frame, &stack, focus, cols[1]);
 }
 
 /// Show only the given agents, in order, as equal vertical rows (approval
 /// triage / plain stack fallback).
-fn draw_triage(frame: &mut Frame, views: &[AgentView], ids: &[AgentId], area: Rect) {
+fn draw_triage(
+    frame: &mut Frame,
+    views: &[AgentView],
+    ids: &[AgentId],
+    focus: Option<AgentId>,
+    area: Rect,
+) {
     let panes: Vec<&AgentView> = ids.iter().filter_map(|i| find(views, *i)).collect();
     if panes.is_empty() {
         draw_empty(frame, area);
         return;
     }
-    draw_stack(frame, &panes, area);
+    draw_stack(frame, &panes, focus, area);
 }
 
 /// Split `area` into equal vertical rows, one per view.
-fn draw_stack(frame: &mut Frame, panes: &[&AgentView], area: Rect) {
+fn draw_stack(frame: &mut Frame, panes: &[&AgentView], focus: Option<AgentId>, area: Rect) {
     let n = panes.len() as u32;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(vec![Constraint::Ratio(1, n); panes.len()])
         .split(area);
     for (view, rect) in panes.iter().zip(rows.iter()) {
-        draw_pane(frame, view, *rect);
+        draw_pane(frame, view, focus == Some(view.meta.id), *rect);
     }
 }
 
 /// Draw one agent pane: a bordered block titled with its status bar, body is the
 /// PTY tail. Urgent agents get a red, bold, `!`-marked frame so they stand out
 /// even in a style-blind (symbol-only) snapshot.
-fn draw_pane(frame: &mut Frame, view: &AgentView, area: Rect) {
+fn draw_pane(frame: &mut Frame, view: &AgentView, focused: bool, area: Rect) {
     let urgent = view.is_urgent();
+    // Urgent (red) wins over focus (cyan); a `▸` marker makes focus visible in a
+    // style-blind snapshot. With no focused pane the output is unchanged.
     let style = if urgent {
-        Style::default()
-            .fg(Color::Red)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else if focused {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Gray)
+    };
+    let title = if focused {
+        format!("\u{25b8} {}", status_bar(view))
+    } else {
+        status_bar(view)
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(style)
-        .title(Span::styled(status_bar(view), style));
+        .title(Span::styled(title, style));
 
     let body: Vec<Line> = view.tail.iter().map(|l| Line::from(l.as_str())).collect();
     frame.render_widget(Paragraph::new(body).block(block), area);

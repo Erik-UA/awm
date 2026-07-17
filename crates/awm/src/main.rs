@@ -140,24 +140,48 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
     let _guard = TermGuard::enter()?;
     let mut tui = AwmTui::new(CrosstermBackend::new(stdout()))?;
     let mut mode = LayoutMode::Tiling;
+    let mut prompt_input: Option<String> = None;
 
     loop {
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
-                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                // Direct keys not covered by the shared keymap.
-                match key.code {
-                    KeyCode::Char('q') if !ctrl => break,
-                    KeyCode::Char('t') if ctrl => {
-                        mode = if mode == LayoutMode::Triage {
-                            LayoutMode::Tiling
-                        } else {
-                            LayoutMode::Triage
-                        };
+                if let Some(buf) = prompt_input.as_mut() {
+                    // Spawn-prompt input mode (opened by Ctrl+p).
+                    match key.code {
+                        KeyCode::Enter => {
+                            let text = std::mem::take(buf);
+                            prompt_input = None;
+                            if !text.is_empty() {
+                                spawn_typed(&mut engine, &spawn_kind, text);
+                            }
+                        }
+                        KeyCode::Esc => prompt_input = None,
+                        KeyCode::Backspace => {
+                            buf.pop();
+                        }
+                        KeyCode::Char(c) => buf.push(c),
+                        _ => {}
                     }
-                    _ => {
-                        if let Some(action) = map_key(key) {
-                            handle_action(action, &mut engine, &mut mode, &spawn_kind);
+                } else {
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    // Direct keys not covered by the shared keymap.
+                    match key.code {
+                        KeyCode::Char('q') if !ctrl => break,
+                        KeyCode::Char('t') if ctrl => {
+                            mode = if mode == LayoutMode::Triage {
+                                LayoutMode::Tiling
+                            } else {
+                                LayoutMode::Triage
+                            };
+                        }
+                        _ => {
+                            if let Some(action) = map_key(key) {
+                                if matches!(action, Action::SpawnPrompt) {
+                                    prompt_input = Some(String::new());
+                                } else {
+                                    handle_action(action, &mut engine, &mut mode, &spawn_kind);
+                                }
+                            }
                         }
                     }
                 }
@@ -166,9 +190,26 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
 
         engine.pump();
         let layout = plan_layout(engine.registry(), mode);
-        tui.render(&engine.registry().views(), &layout)?;
+        let focus = engine.registry().focus();
+        tui.draw(
+            &engine.registry().views(),
+            &layout,
+            focus,
+            prompt_input.as_deref(),
+        )?;
     }
     Ok(())
+}
+
+/// Spawn an agent from a typed prompt, using the app's spawn kind (Claude gets
+/// the prompt; mock ignores it but still spawns).
+fn spawn_typed(engine: &mut Engine, kind: &Spawn, text: String) {
+    let spawn = match kind {
+        Spawn::Claude(_) => Spawn::Claude(text),
+        Spawn::Mock => Spawn::Mock,
+    };
+    let (spec, prompt, handshake) = spec_for(&spawn);
+    let _ = engine.spawn(spec, "spawned", Tags::empty(), prompt, handshake);
 }
 
 fn handle_action(action: Action, engine: &mut Engine, mode: &mut LayoutMode, spawn_kind: &Spawn) {
