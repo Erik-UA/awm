@@ -26,14 +26,20 @@ version = "0.1.0"
 dependencies = [
  "awm-core",
  "awm-proto",
+ "awm-pty",
+ "awm-tui",
+ "crossterm",
+ "ratatui",
 ]
 
 [[package]]
 name = "awm-core"
 version = "0.1.0"
 dependencies = [
+ "awm-parser",
  "awm-proto",
- "tokio",
+ "awm-pty",
+ "serde_json",
 ]
 
 [[package]]
