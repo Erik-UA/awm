@@ -20,6 +20,11 @@ record-fixture name prompt:
         > fixtures/{{name}}.jsonl
     @echo "recorded fixtures/{{name}}.jsonl — remember to author its .expected.json"
 
-# Placeholder until the runtime lands (Phase 3).
+# Headless demo: agents block on approval → urgent → master → approve → resume.
 demo:
-    cargo run -p awm
+    cargo run -p awm -- --demo
+
+# Interactive runtime (needs a real terminal). Mock agents by default; pass
+# `--claude "<prompt>"` (repeatable) for live agents.
+run *ARGS:
+    cargo run -p awm -- {{ARGS}}
