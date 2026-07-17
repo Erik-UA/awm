@@ -70,3 +70,26 @@ fn master_stack_promotes_urgent_agent() {
 
     insta::assert_snapshot!("master_stack", buffer_to_string(tui.backend()));
 }
+
+#[test]
+fn monocle_full_screens_one_agent() {
+    let mut tui = AwmTui::new(TestBackend::new(80, 24)).unwrap();
+    let views = sample_views();
+
+    // Zoom the builder (@0) to a full-screen monocle.
+    tui.render(&views, &LayoutCmd::Monocle(AgentId(0))).unwrap();
+
+    insta::assert_snapshot!("monocle", buffer_to_string(tui.backend()));
+}
+
+#[test]
+fn triage_shows_only_listed_agents_in_order() {
+    let mut tui = AwmTui::new(TestBackend::new(80, 24)).unwrap();
+    let views = sample_views();
+
+    // Triage lists the urgent agent first, then the builder.
+    tui.render(&views, &LayoutCmd::Triage(vec![AgentId(1), AgentId(0)]))
+        .unwrap();
+
+    insta::assert_snapshot!("triage", buffer_to_string(tui.backend()));
+}
