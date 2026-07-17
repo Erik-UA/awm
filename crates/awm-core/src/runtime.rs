@@ -101,6 +101,13 @@ impl Engine {
                     Err(_) => break,
                 }
             }
+            // Process-death safety net: if the stream ended without a `result`
+            // (the child crashed or was killed), this marks the agent Failed.
+            // If it already finished cleanly, the terminal state absorbs it.
+            let _ = tx.send(CoreEvent {
+                id,
+                event: AgentEvent::Finished { ok: false },
+            });
             let _ = runner.wait();
         });
         self.readers.push(handle);

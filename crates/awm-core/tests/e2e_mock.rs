@@ -10,9 +10,15 @@ use awm_proto::{AgentId, AgentState, LayoutCmd, Tags};
 use std::path::PathBuf;
 use std::time::Duration;
 
-fn mock_spec() -> CommandSpec {
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/mock-agent.py");
+fn script_spec(file: &str) -> CommandSpec {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures")
+        .join(file);
     CommandSpec::new("python3", std::env::temp_dir()).arg(script.to_str().unwrap())
+}
+
+fn mock_spec() -> CommandSpec {
+    script_spec("mock-agent.py")
 }
 
 fn pump_until(engine: &mut Engine, mut done: impl FnMut(&Engine) -> bool) -> bool {
@@ -67,6 +73,74 @@ fn agents_block_promote_to_master_then_resume_on_approve() {
         assert_eq!(engine.registry().record(*id).unwrap().state, AgentState::Done);
     }
 
+    engine.join();
+}
+
+#[test]
+fn dead_agent_becomes_failed_not_stuck() {
+    let mut engine = Engine::new();
+    let id = engine
+        .spawn(script_spec("mock-die.py"), "dying", Tags::empty(), None, false)
+        .unwrap();
+
+    let terminal = pump_until(&mut engine, |e| {
+        e.registry()
+            .record(id)
+            .map(|r| r.state.is_terminal())
+            .unwrap_or(false)
+    });
+    assert!(terminal, "a crashed agent must reach a terminal state, not hang");
+    assert_eq!(engine.registry().record(id).unwrap().state, AgentState::Failed);
+
+    engine.join();
+}
+
+#[test]
+fn scale_twelve_agents_block_and_resume() {
+    let mut engine = Engine::new();
+    let ids: Vec<AgentId> = (0..12)
+        .map(|i| {
+            engine
+                .spawn(mock_spec(), format!("a{i}"), Tags::empty(), None, false)
+                .unwrap()
+        })
+        .collect();
+
+    let blocked = pump_until(&mut engine, |e| {
+        ids.iter()
+            .all(|id| e.registry().pending_request_id(*id).is_some())
+    });
+    assert!(blocked, "all 12 agents should block");
+    // urgent → master still picks a single (oldest) blocked agent.
+    let order = engine.registry().blocked_ordered();
+    assert_eq!(order.len(), 12);
+    assert_eq!(
+        plan_layout(engine.registry(), LayoutMode::Tiling),
+        LayoutCmd::SetMaster(order[0])
+    );
+
+    for id in &ids {
+        engine.answer(*id, Decision::Allow).unwrap();
+    }
+    let finished = pump_until(&mut engine, |e| e.registry().all_terminal());
+    assert!(finished, "all 12 agents should finish after approval");
+    engine.join();
+}
+
+#[test]
+fn noisy_stream_still_reaches_done() {
+    let mut engine = Engine::new();
+    let id = engine
+        .spawn(script_spec("mock-noisy.py"), "noisy", Tags::empty(), None, false)
+        .unwrap();
+
+    let blocked = pump_until(&mut engine, |e| e.registry().pending_request_id(id).is_some());
+    assert!(blocked, "agent should block despite garbage lines in the stream");
+    engine.answer(id, Decision::Allow).unwrap();
+
+    let finished = pump_until(&mut engine, |e| e.registry().all_terminal());
+    assert!(finished, "agent should finish despite noise");
+    assert_eq!(engine.registry().record(id).unwrap().state, AgentState::Done);
     engine.join();
 }
 
