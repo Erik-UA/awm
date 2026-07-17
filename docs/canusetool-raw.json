@@ -1,0 +1,33 @@
+[
+  {
+    "type": "control_request",
+    "request_id": "41dbce5f-cfaf-49d1-9b78-eb919c8849da",
+    "request": {
+      "subtype": "can_use_tool",
+      "tool_name": "Write",
+      "display_name": "Write",
+      "input": {
+        "file_path": "/tmp/spike.txt",
+        "content": "hello\n"
+      },
+      "description": "/tmp/spike.txt",
+      "permission_suggestions": [
+        {
+          "type": "setMode",
+          "mode": "acceptEdits",
+          "destination": "session"
+        },
+        {
+          "type": "addDirectories",
+          "directories": [
+            "/tmp"
+          ],
+          "destination": "session"
+        }
+      ],
+      "decision_reason": "Path is outside allowed working directories",
+      "decision_reason_type": "workingDir",
+      "tool_use_id": "toolu_01Nos3fhkUa4zt7afzvdJBC3"
+    }
+  }
+]

@@ -1,0 +1,9 @@
+{"type": "control_response", "response": {"subtype": "success", "request_id": "init-1", "response": {"commands": "[43 slash-commands omitted]"}}}
+{"type": "control_response", "response": {"subtype": "success", "request_id": "pm-1", "response": {"mode": "default"}}}
+{"type": "system", "subtype": "init", "permissionMode": "default", "claude_code_version": "2.1.212"}
+{"type": "rate_limit_event"}
+{"type": "assistant", "content_kinds": [{"type": "text", "text": "I'll run that command."}]}
+{"type": "assistant", "content_kinds": [{"type": "tool_use", "name": "Bash"}]}
+{"type": "user"}
+{"type": "assistant", "content_kinds": [{"type": "text", "text": "The command ran and printed `hello-from-awm`."}]}
+{"type": "result", "subtype": "success", "is_error": false, "permission_denials": [], "result": "The command ran and printed `hello-from-awm`."}
