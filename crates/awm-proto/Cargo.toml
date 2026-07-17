@@ -1,0 +1,15 @@
+[package]
+name = "awm-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "awm contracts: AgentEvent, AgentState, layout commands, and the EventSource/Renderer traits. Frozen after Phase 1."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+bitflags = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
