@@ -30,7 +30,7 @@ fn agents_block_promote_to_master_then_resume_on_approve() {
     let mut engine = Engine::new();
     let ids: Vec<AgentId> = ["a", "b", "c"]
         .iter()
-        .map(|n| engine.spawn(mock_spec(), *n, Tags::empty(), None).unwrap())
+        .map(|n| engine.spawn(mock_spec(), *n, Tags::empty(), None, false).unwrap())
         .collect();
 
     // All three reach the approval gate.
@@ -73,7 +73,7 @@ fn agents_block_promote_to_master_then_resume_on_approve() {
 #[test]
 fn denying_makes_the_agent_fail() {
     let mut engine = Engine::new();
-    let id = engine.spawn(mock_spec(), "d", Tags::empty(), None).unwrap();
+    let id = engine.spawn(mock_spec(), "d", Tags::empty(), None, false).unwrap();
 
     assert!(pump_until(&mut engine, |e| e
         .registry()

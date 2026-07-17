@@ -37,23 +37,30 @@ fn mock_script() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/mock-agent.py")
 }
 
-fn spec_for(kind: &Spawn) -> (CommandSpec, Option<String>) {
+/// Build the spawn spec for `kind`: the command, an optional initial prompt, and
+/// whether it needs the control-protocol `initialize` handshake (real claude does).
+fn spec_for(kind: &Spawn) -> (CommandSpec, Option<String>, bool) {
     match kind {
         Spawn::Mock => (
             CommandSpec::new("python3", std::env::temp_dir())
                 .arg(mock_script().to_string_lossy().to_string()),
             None,
+            false,
         ),
         Spawn::Claude(prompt) => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+            // `--permission-prompt-tool stdio` routes approval gates to us over the
+            // control channel as `can_use_tool` requests (see docs/approval-findings.md).
             let spec = CommandSpec::new("claude", cwd)
                 .arg("-p")
                 .arg("--input-format")
                 .arg("stream-json")
                 .arg("--output-format")
                 .arg("stream-json")
-                .arg("--verbose");
-            (spec, Some(prompt.clone()))
+                .arg("--verbose")
+                .arg("--permission-prompt-tool")
+                .arg("stdio");
+            (spec, Some(prompt.clone()), true)
         }
     }
 }
@@ -89,8 +96,8 @@ fn main() -> std::io::Result<()> {
 fn run_demo() -> std::io::Result<()> {
     let mut engine = Engine::new();
     for name in ["builder", "cleaner", "tester"] {
-        let (spec, prompt) = spec_for(&Spawn::Mock);
-        engine.spawn(spec, name, Tags::empty(), prompt)?;
+        let (spec, prompt, handshake) = spec_for(&Spawn::Mock);
+        engine.spawn(spec, name, Tags::empty(), prompt, handshake)?;
     }
     let ids: Vec<AgentId> = engine.registry().order().to_vec();
     let mut tui = AwmTui::new(TestBackend::new(92, 18))?;
@@ -120,12 +127,12 @@ fn run_demo() -> std::io::Result<()> {
 fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
     let mut engine = Engine::new();
     for (i, kind) in roster.iter().enumerate() {
-        let (spec, prompt) = spec_for(kind);
+        let (spec, prompt, handshake) = spec_for(kind);
         let name = match kind {
             Spawn::Mock => format!("mock-{i}"),
             Spawn::Claude(_) => format!("claude-{i}"),
         };
-        engine.spawn(spec, name, Tags::empty(), prompt)?;
+        engine.spawn(spec, name, Tags::empty(), prompt, handshake)?;
     }
     // Remember what Mod+p should spawn (first roster kind, or Mock).
     let spawn_kind = roster.first().cloned().unwrap_or(Spawn::Mock);
@@ -185,8 +192,8 @@ fn handle_action(action: Action, engine: &mut Engine, mode: &mut LayoutMode, spa
             }
         }
         Action::SpawnPrompt => {
-            let (spec, prompt) = spec_for(spawn_kind);
-            let _ = engine.spawn(spec, "spawned", Tags::empty(), prompt);
+            let (spec, prompt, handshake) = spec_for(spawn_kind);
+            let _ = engine.spawn(spec, "spawned", Tags::empty(), prompt, handshake);
         }
         Action::Approve => answer_target(engine, Decision::Allow),
         Action::Deny => answer_target(engine, Decision::Deny("denied from awm".into())),

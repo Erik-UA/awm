@@ -58,12 +58,17 @@ impl Engine {
 
     /// Spawn an agent from `spec`, optionally sending an initial `prompt`.
     /// Starts its reader thread and returns the new agent id.
+    ///
+    /// `handshake` runs the SDK `initialize` control-protocol handshake before
+    /// the prompt — required for a real `claude` (with `--permission-prompt-tool
+    /// stdio`) to route approval gates to us; leave it `false` for mock agents.
     pub fn spawn(
         &mut self,
         spec: CommandSpec,
         name: impl Into<String>,
         tags: Tags,
         prompt: Option<String>,
+        handshake: bool,
     ) -> std::io::Result<AgentId> {
         let id = self.reg.alloc_id();
         let mut meta = AgentMeta::new(id, name, spec.cwd.clone(), 0);
@@ -71,6 +76,9 @@ impl Engine {
         self.reg.add(meta);
 
         let mut runner = StreamJsonRunner::spawn(&spec)?;
+        if handshake {
+            runner.send_initialize()?;
+        }
         if let Some(p) = prompt {
             runner.send_prompt(&p)?;
         }

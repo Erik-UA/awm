@@ -276,6 +276,13 @@ impl StreamJsonRunner {
         self.answerer.send_prompt(text)
     }
 
+    /// Perform the SDK control-protocol `initialize` handshake. Required before a
+    /// real `claude` (run with `--permission-prompt-tool stdio`) will route
+    /// `can_use_tool` approval gates to us. Not used for mock agents.
+    pub fn send_initialize(&mut self) -> std::io::Result<()> {
+        self.answerer.send_initialize()
+    }
+
     /// Read the next chunk of raw stdout bytes to feed the parser. Returns an
     /// empty vec at end-of-stream.
     pub fn read(&mut self) -> std::io::Result<Vec<u8>> {
@@ -336,6 +343,13 @@ impl Answerer {
             json_escape(text)
         );
         self.write_line(&line)
+    }
+
+    /// Send the `initialize` control_request that opens the SDK control protocol.
+    pub fn send_initialize(&self) -> std::io::Result<()> {
+        self.write_line(
+            r#"{"type":"control_request","request_id":"awm-init","request":{"subtype":"initialize"}}"#,
+        )
     }
 
     /// Write a single newline-terminated line to the agent's stdin and flush.

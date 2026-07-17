@@ -180,15 +180,20 @@ impl StreamParser {
     }
 
     fn parse_control_response(&mut self, value: &Value) {
-        // Shape: response.response.behavior == "allow" | "deny".
-        let behavior = value
+        // Shape: response.response.behavior == "allow" | "deny". Control responses
+        // to non-permission requests (e.g. the `initialize` handshake reply) carry
+        // no `behavior` — those are not approval resolutions, so map them to Noise.
+        match value
             .get("response")
             .and_then(|r| r.get("response"))
             .and_then(|r| r.get("behavior"))
-            .and_then(Value::as_str);
-        let approved = behavior == Some("allow");
-        self.ready
-            .push_back(AgentEvent::ApprovalResolved { approved });
+            .and_then(Value::as_str)
+        {
+            Some(behavior) => self.ready.push_back(AgentEvent::ApprovalResolved {
+                approved: behavior == "allow",
+            }),
+            None => self.ready.push_back(AgentEvent::Noise),
+        }
     }
 
     fn parse_result(&mut self, value: &Value) {
