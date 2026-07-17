@@ -28,7 +28,32 @@ use ratatui::backend::{CrosstermBackend, TestBackend};
 #[derive(Clone)]
 enum Spawn {
     Mock,
+    /// A multi-turn mock that holds a conversation (for the dialogue demo).
+    MockChat,
     Claude(String),
+}
+
+/// An in-progress text entry in the bottom bar.
+enum Input {
+    /// `Ctrl+p` — a prompt for a NEW agent.
+    Spawn(String),
+    /// `i` — a follow-up message to an existing (focused) agent.
+    Message(awm_proto::AgentId, String),
+}
+
+impl Input {
+    fn buffer(&mut self) -> &mut String {
+        match self {
+            Input::Spawn(s) | Input::Message(_, s) => s,
+        }
+    }
+
+    fn bar(&self) -> String {
+        match self {
+            Input::Spawn(s) => format!("spawn agent> {s}"),
+            Input::Message(id, s) => format!("{id} message> {s}"),
+        }
+    }
 }
 
 fn mock_script() -> PathBuf {
@@ -47,6 +72,16 @@ fn spec_for(kind: &Spawn) -> (CommandSpec, Option<String>, bool) {
             None,
             false,
         ),
+        Spawn::MockChat => {
+            let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/mock-chat.py");
+            (
+                CommandSpec::new("python3", std::env::temp_dir())
+                    .arg(script.to_string_lossy().to_string()),
+                Some("hello".into()),
+                false,
+            )
+        }
         Spawn::Claude(prompt) => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
             // `--permission-prompt-tool stdio` routes approval gates to us over the
@@ -83,6 +118,7 @@ fn main() -> std::io::Result<()> {
                 }
             }
             "--mock" => roster.push(Spawn::Mock),
+            "--chat" => roster.push(Spawn::MockChat),
             _ => {}
         }
     }
@@ -130,6 +166,7 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
         let (spec, prompt, handshake) = spec_for(kind);
         let name = match kind {
             Spawn::Mock => format!("mock-{i}"),
+            Spawn::MockChat => format!("chat-{i}"),
             Spawn::Claude(_) => format!("claude-{i}"),
         };
         engine.spawn(spec, name, Tags::empty(), prompt, handshake)?;
@@ -140,26 +177,34 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
     let _guard = TermGuard::enter()?;
     let mut tui = AwmTui::new(CrosstermBackend::new(stdout()))?;
     let mut mode = LayoutMode::Tiling;
-    let mut prompt_input: Option<String> = None;
+    let mut input: Option<Input> = None;
 
     loop {
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
-                if let Some(buf) = prompt_input.as_mut() {
-                    // Spawn-prompt input mode (opened by Ctrl+p).
+                if input.is_some() {
+                    // Text-entry mode (spawn prompt or a message to an agent).
                     match key.code {
-                        KeyCode::Enter => {
-                            let text = std::mem::take(buf);
-                            prompt_input = None;
-                            if !text.is_empty() {
-                                spawn_typed(&mut engine, &spawn_kind, text);
+                        KeyCode::Enter => match input.take() {
+                            Some(Input::Spawn(text)) if !text.is_empty() => {
+                                spawn_typed(&mut engine, &spawn_kind, text)
+                            }
+                            Some(Input::Message(id, text)) if !text.is_empty() => {
+                                let _ = engine.send_message(id, &text);
+                            }
+                            _ => {}
+                        },
+                        KeyCode::Esc => input = None,
+                        KeyCode::Backspace => {
+                            if let Some(i) = input.as_mut() {
+                                i.buffer().pop();
                             }
                         }
-                        KeyCode::Esc => prompt_input = None,
-                        KeyCode::Backspace => {
-                            buf.pop();
+                        KeyCode::Char(c) => {
+                            if let Some(i) = input.as_mut() {
+                                i.buffer().push(c);
+                            }
                         }
-                        KeyCode::Char(c) => buf.push(c),
                         _ => {}
                     }
                 } else {
@@ -167,6 +212,12 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
                     // Direct keys not covered by the shared keymap.
                     match key.code {
                         KeyCode::Char('q') if !ctrl => break,
+                        // `i` — talk to the focused agent (send a follow-up).
+                        KeyCode::Char('i') if !ctrl => {
+                            if let Some(f) = engine.registry().focus() {
+                                input = Some(Input::Message(f, String::new()));
+                            }
+                        }
                         KeyCode::Char('t') if ctrl => {
                             mode = if mode == LayoutMode::Triage {
                                 LayoutMode::Tiling
@@ -182,7 +233,7 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
                         _ => {
                             if let Some(action) = map_key(key) {
                                 if matches!(action, Action::SpawnPrompt) {
-                                    prompt_input = Some(String::new());
+                                    input = Some(Input::Spawn(String::new()));
                                 } else {
                                     handle_action(action, &mut engine, &mut mode, &spawn_kind);
                                 }
@@ -196,12 +247,8 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
         engine.pump();
         let layout = plan_layout(engine.registry(), mode);
         let focus = engine.registry().focus();
-        tui.draw(
-            &engine.registry().views(),
-            &layout,
-            focus,
-            prompt_input.as_deref(),
-        )?;
+        let bar = input.as_ref().map(|i| i.bar());
+        tui.draw(&engine.registry().views(), &layout, focus, bar.as_deref())?;
     }
     Ok(())
 }
@@ -211,6 +258,7 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
 fn spawn_typed(engine: &mut Engine, kind: &Spawn, text: String) {
     let spawn = match kind {
         Spawn::Claude(_) => Spawn::Claude(text),
+        Spawn::MockChat => Spawn::MockChat,
         Spawn::Mock => Spawn::Mock,
     };
     let (spec, prompt, handshake) = spec_for(&spawn);

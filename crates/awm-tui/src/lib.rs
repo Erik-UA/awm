@@ -106,9 +106,10 @@ fn render_into(
     }
 }
 
-/// The bottom spawn-prompt input bar (shown while typing a `Ctrl+p` prompt).
+/// The bottom input bar (the caller supplies the full label + text; a block
+/// cursor is appended). Used for both the spawn prompt and agent messages.
 fn draw_prompt_bar(frame: &mut Frame, text: &str, area: Rect) {
-    let line = format!("spawn agent> {text}\u{2588}");
+    let line = format!("{text}\u{2588}");
     let style = Style::default().fg(Color::Black).bg(Color::Cyan);
     frame.render_widget(Paragraph::new(line).style(style), area);
 }

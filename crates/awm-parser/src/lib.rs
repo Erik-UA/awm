@@ -112,9 +112,17 @@ impl StreamParser {
         {
             for block in content {
                 match block.get("type").and_then(Value::as_str) {
-                    Some("text") | Some("thinking") => {
-                        self.ready.push_back(AgentEvent::Thinking);
+                    // Assistant text is shown in the agent's window; internal
+                    // reasoning (`thinking`) is just a "working" signal.
+                    Some("text") => {
+                        let text = block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        self.ready.push_back(AgentEvent::Message { text });
                     }
+                    Some("thinking") => self.ready.push_back(AgentEvent::Thinking),
                     Some("tool_use") => {
                         let name = block
                             .get("name")

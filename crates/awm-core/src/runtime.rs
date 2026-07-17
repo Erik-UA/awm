@@ -157,6 +157,17 @@ impl Engine {
         Ok(())
     }
 
+    /// Send a follow-up message to a live agent (dialogue). Writes a stream-json
+    /// user message on its stdin and echoes it into the agent's window. The
+    /// agent's reply arrives as `Message` events on its stream.
+    pub fn send_message(&mut self, id: AgentId, text: &str) -> std::io::Result<()> {
+        if let Some(answerer) = self.answerers.get(&id) {
+            answerer.send_prompt(text)?;
+            self.reg.push_note(id, format!("\u{25b7} you: {text}"));
+        }
+        Ok(())
+    }
+
     /// Terminate an agent's process. Its reader thread then sees EOF and the
     /// agent transitions to Failed (via the EOF safety net). No-op if unknown.
     pub fn kill(&mut self, id: AgentId) {

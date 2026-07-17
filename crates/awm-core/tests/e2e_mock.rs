@@ -145,6 +145,42 @@ fn noisy_stream_still_reaches_done() {
 }
 
 #[test]
+fn multi_turn_dialogue_shows_replies_in_the_window() {
+    let mut engine = Engine::new();
+    let id = engine
+        .spawn(
+            script_spec("mock-chat.py"),
+            "chat",
+            Tags::empty(),
+            Some("hello".into()),
+            false,
+        )
+        .unwrap();
+
+    let tail_has = |e: &Engine, needle: &str| {
+        e.registry()
+            .record(id)
+            .map(|r| r.tail.iter().any(|l| l.contains(needle)))
+            .unwrap_or(false)
+    };
+
+    // First turn: the spawn prompt "hello" gets echoed back.
+    assert!(pump_until(&mut engine, |e| tail_has(e, "echo: hello")));
+
+    // Second turn: send a follow-up to the LIVE agent, see its reply.
+    engine.send_message(id, "how are you").unwrap();
+    assert!(pump_until(&mut engine, |e| tail_has(e, "echo: how are you")));
+
+    // The user's own line is echoed into the window too (dialogue view).
+    assert!(tail_has(&engine, "you: how are you"));
+    // Still the same live session — not a new agent, not terminal.
+    assert!(!engine.registry().record(id).unwrap().state.is_terminal());
+
+    engine.send_message(id, "bye").unwrap(); // let it end cleanly
+    engine.join();
+}
+
+#[test]
 fn killing_a_blocked_agent_makes_it_terminal() {
     let mut engine = Engine::new();
     let id = engine

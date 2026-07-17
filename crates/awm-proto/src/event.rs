@@ -19,8 +19,11 @@ use std::path::PathBuf;
 pub enum AgentEvent {
     /// Session initialized (maps from the stream-json `system/init` event).
     Started { model: String, cwd: PathBuf },
-    /// The agent produced assistant text — it is actively working.
+    /// The agent is reasoning (a `thinking` block) — actively working, no
+    /// user-facing text.
     Thinking,
+    /// Assistant output text, to show in the agent's window (enables dialogue).
+    Message { text: String },
     /// The agent began invoking a tool.
     ToolStarted { name: String },
     /// The agent is blocked awaiting approval for a tool call. This is the

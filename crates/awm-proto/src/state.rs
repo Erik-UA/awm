@@ -49,7 +49,7 @@ impl AgentState {
 
         match event {
             E::Started { .. } => S::Working,
-            E::Thinking | E::ToolStarted { .. } => S::Working,
+            E::Thinking | E::Message { .. } | E::ToolStarted { .. } => S::Working,
             E::ApprovalRequested(_) => S::BlockedOnApproval,
             // Whether approved or denied, the agent resumes working (it either
             // proceeds or handles the denial before finishing).

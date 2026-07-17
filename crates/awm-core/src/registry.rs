@@ -168,6 +168,14 @@ impl Registry {
         self.agents.get(&id)
     }
 
+    /// Append an out-of-band line to an agent's window (e.g. the user's own
+    /// message in a dialogue). No state change.
+    pub fn push_note(&mut self, id: AgentId, line: String) {
+        if let Some(rec) = self.agents.get_mut(&id) {
+            rec.push_tail(line);
+        }
+    }
+
     pub fn pending_request_id(&self, id: AgentId) -> Option<String> {
         self.agents
             .get(&id)?
@@ -211,6 +219,11 @@ impl Registry {
 fn describe(event: &AgentEvent) -> Option<String> {
     match event {
         AgentEvent::Started { model, .. } => Some(format!("● session started ({model})")),
+        // The agent's actual reply — the thing you read in its window.
+        AgentEvent::Message { text } => {
+            let flat = text.replace('\n', " ");
+            Some(format!("◀ {}", flat.trim()))
+        }
         AgentEvent::ToolStarted { name } => Some(format!("→ {name}")),
         AgentEvent::ApprovalRequested(ctx) => Some(format!(
             "⏸ approval: {} {}",
