@@ -1,12 +1,47 @@
-//! Track A — PTY session management. **Stub for Phase 2.**
+//! Track A — PTY session management + agent-runner control channel.
 //!
-//! The public API below is the frozen surface the Track A subagent implements
-//! against; bodies are `unimplemented!()` so acceptance tests compile and fail
-//! (the red gate) until the work lands.
+//! Two things live here:
+//! 1. [`PtySession`] — spawn/kill/resize a child inside a PTY with a bounded
+//!    output ring buffer (the manual `e`/attach case).
+//! 2. [`StreamJsonRunner`] — spawn the agent over piped stdio in stream-json
+//!    mode, expose raw stdout bytes to the parser (Track B), and act as the
+//!    permission controller by writing `control_response` lines on a
+//!    `can_use_tool` gate (see `docs/approval-findings.md`).
 
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
+use std::io::Read;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+/// Wrap any `Display`able error (e.g. `portable-pty`'s `anyhow::Error`) as an
+/// `io::Error` so the public API can stay `std::io::Result`.
+fn other_err<E: std::fmt::Display>(e: E) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+}
+
+/// Minimal JSON string escaper for the small set of fields we serialize by hand
+/// (`request_id`, deny messages, prompt text). Avoids pulling in a JSON crate
+/// just to emit a couple of fixed-shape lines.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 /// How to launch a child process inside a PTY.
 #[derive(Clone, Debug)]
@@ -36,33 +71,127 @@ impl CommandSpec {
 
 /// A running (or finished) PTY-backed child with a bounded output ring buffer.
 pub struct PtySession {
-    _private: (),
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    ring: Arc<Mutex<VecDeque<String>>>,
+    reader: Option<JoinHandle<()>>,
 }
 
 impl PtySession {
     /// Spawn `spec` in a new PTY. Retains the last `ring_lines` lines of output.
-    pub fn spawn(_spec: &CommandSpec, _ring_lines: usize) -> std::io::Result<Self> {
-        unimplemented!("Track A / Phase 2")
+    pub fn spawn(spec: &CommandSpec, ring_lines: usize) -> std::io::Result<Self> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(other_err)?;
+
+        let mut cmd = CommandBuilder::new(&spec.program);
+        for a in &spec.args {
+            cmd.arg(a);
+        }
+        cmd.cwd(&spec.cwd);
+        for (k, v) in &spec.env {
+            cmd.env(k, v);
+        }
+
+        let child = pair.slave.spawn_command(cmd).map_err(other_err)?;
+        // Drop the slave so the reader sees EOF once the child exits and its
+        // own slave fd is the last one closed.
+        drop(pair.slave);
+
+        let reader_handle = pair.master.try_clone_reader().map_err(other_err)?;
+        let ring: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let ring_for_thread = Arc::clone(&ring);
+        let reader = std::thread::spawn(move || {
+            pump_lines(reader_handle, ring_for_thread, ring_lines);
+        });
+
+        Ok(PtySession {
+            master: pair.master,
+            child,
+            ring,
+            reader: Some(reader),
+        })
     }
 
     /// The most recent `n` buffered output lines, oldest first.
-    pub fn tail(&self, _n: usize) -> Vec<String> {
-        unimplemented!("Track A / Phase 2")
+    pub fn tail(&self, n: usize) -> Vec<String> {
+        let guard = self.ring.lock().unwrap();
+        let start = guard.len().saturating_sub(n);
+        guard.iter().skip(start).cloned().collect()
     }
 
     /// Resize the PTY window.
-    pub fn resize(&mut self, _rows: u16, _cols: u16) -> std::io::Result<()> {
-        unimplemented!("Track A / Phase 2")
+    pub fn resize(&mut self, rows: u16, cols: u16) -> std::io::Result<()> {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(other_err)
     }
 
     /// Block until the child exits and return its status code.
     pub fn wait(&mut self) -> std::io::Result<i32> {
-        unimplemented!("Track A / Phase 2")
+        let status = self.child.wait().map_err(other_err)?;
+        // Drain the reader thread so the ring buffer reflects all output before
+        // callers `tail()`.
+        if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
+        }
+        Ok(status.exit_code() as i32)
     }
 
     /// Terminate the child.
     pub fn kill(&mut self) -> std::io::Result<()> {
-        unimplemented!("Track A / Phase 2")
+        self.child.kill().map_err(other_err)
+    }
+}
+
+/// Read `reader` to EOF, splitting into lines and pushing them into `ring`,
+/// evicting from the front so at most `cap` lines are retained.
+fn pump_lines(mut reader: Box<dyn Read + Send>, ring: Arc<Mutex<VecDeque<String>>>, cap: usize) {
+    let mut buf = [0u8; 4096];
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                for &b in &buf[..n] {
+                    if b == b'\n' {
+                        push_line(&ring, &mut line, cap);
+                    } else {
+                        line.push(b);
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    if !line.is_empty() {
+        push_line(&ring, &mut line, cap);
+    }
+}
+
+fn push_line(ring: &Arc<Mutex<VecDeque<String>>>, line: &mut Vec<u8>, cap: usize) {
+    // PTY output is CRLF-terminated; drop the trailing CR.
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    let s = String::from_utf8_lossy(line).into_owned();
+    line.clear();
+    let mut guard = ring.lock().unwrap();
+    guard.push_back(s);
+    while guard.len() > cap {
+        guard.pop_front();
     }
 }
 
@@ -80,37 +209,182 @@ pub enum Decision {
 /// controller. Raw stdout bytes are exposed for the parser (Track B); approval
 /// gates are answered by writing a `control_response` line back to the agent.
 ///
-/// This is the primary integration path for the killer feature — see
-/// `docs/approval-findings.md`. **Stub for Phase 2.**
+/// The public API is synchronous; a small current-thread tokio runtime drives
+/// the async child process underneath.
 pub struct StreamJsonRunner {
-    _private: (),
+    rt: tokio::runtime::Runtime,
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
 }
 
 impl StreamJsonRunner {
     /// Spawn the agent with piped stdin/stdout in stream-json mode.
-    pub fn spawn(_spec: &CommandSpec) -> std::io::Result<Self> {
-        unimplemented!("Track A / Phase 2")
+    pub fn spawn(spec: &CommandSpec) -> std::io::Result<Self> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        let (child, stdin, stdout) = rt.block_on(async {
+            let mut cmd = tokio::process::Command::new(&spec.program);
+            cmd.args(&spec.args)
+                .current_dir(&spec.cwd)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped());
+            for (k, v) in &spec.env {
+                cmd.env(k, v);
+            }
+            let mut child = cmd.spawn()?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| other_err("child stdin was not piped"))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| other_err("child stdout was not piped"))?;
+            Ok::<_, std::io::Error>((child, stdin, stdout))
+        })?;
+
+        Ok(StreamJsonRunner {
+            rt,
+            child,
+            stdin,
+            stdout,
+        })
     }
 
     /// Send a user prompt as a stream-json input message.
-    pub fn send_prompt(&mut self, _text: &str) -> std::io::Result<()> {
-        unimplemented!("Track A / Phase 2")
+    pub fn send_prompt(&mut self, text: &str) -> std::io::Result<()> {
+        let line = format!(
+            r#"{{"type":"user","message":{{"role":"user","content":"{}"}}}}"#,
+            json_escape(text)
+        );
+        self.write_line(&line)
     }
 
     /// Read the next chunk of raw stdout bytes to feed the parser. Returns an
     /// empty vec at end-of-stream.
     pub fn read(&mut self) -> std::io::Result<Vec<u8>> {
-        unimplemented!("Track A / Phase 2")
+        use tokio::io::AsyncReadExt;
+        let StreamJsonRunner { rt, stdout, .. } = self;
+        rt.block_on(async {
+            let mut buf = vec![0u8; 8192];
+            let n = stdout.read(&mut buf).await?;
+            buf.truncate(n);
+            Ok(buf)
+        })
     }
 
     /// Answer a pending `can_use_tool` request (by envelope `request_id`) by
     /// writing the corresponding `control_response` line.
-    pub fn answer(&mut self, _request_id: &str, _decision: Decision) -> std::io::Result<()> {
-        unimplemented!("Track A / Phase 2")
+    pub fn answer(&mut self, request_id: &str, decision: Decision) -> std::io::Result<()> {
+        let inner = match decision {
+            Decision::Allow => r#"{"behavior":"allow","updatedInput":{}}"#.to_string(),
+            Decision::Deny(reason) => {
+                format!(r#"{{"behavior":"deny","message":"{}"}}"#, json_escape(&reason))
+            }
+        };
+        let line = format!(
+            r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{}","response":{}}}}}"#,
+            json_escape(request_id),
+            inner
+        );
+        self.write_line(&line)
     }
 
     /// Block until the agent exits and return its status code.
     pub fn wait(&mut self) -> std::io::Result<i32> {
-        unimplemented!("Track A / Phase 2")
+        let StreamJsonRunner { rt, child, .. } = self;
+        let status = rt.block_on(async { child.wait().await })?;
+        Ok(status.code().unwrap_or(-1))
+    }
+
+    /// Write a single newline-terminated line to the agent's stdin and flush.
+    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let StreamJsonRunner { rt, stdin, .. } = self;
+        let mut bytes = line.as_bytes().to_vec();
+        bytes.push(b'\n');
+        rt.block_on(async {
+            stdin.write_all(&bytes).await?;
+            stdin.flush().await?;
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pushing more than `cap` lines evicts the oldest, keeping the newest `cap`.
+    #[test]
+    fn ring_buffer_evicts_oldest_beyond_cap() {
+        let ring: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let cap = 3;
+        for i in 0..10u32 {
+            // Include a trailing CR to confirm it is stripped.
+            let mut line = format!("line{i}\r").into_bytes();
+            push_line(&ring, &mut line, cap);
+        }
+        let guard = ring.lock().unwrap();
+        let got: Vec<&str> = guard.iter().map(String::as_str).collect();
+        assert_eq!(got, vec!["line7", "line8", "line9"]);
+        assert_eq!(guard.len(), cap);
+    }
+
+    fn mock_agent() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/mock-agent.py")
+    }
+
+    fn extract_request_id(buf: &str) -> Option<String> {
+        for line in buf.lines() {
+            if line.contains("\"can_use_tool\"") {
+                let anchor = "\"request_id\"";
+                let i = line.find(anchor)?;
+                let rest = line[i + anchor.len()..].trim_start();
+                let rest = rest.strip_prefix(':')?.trim_start();
+                let rest = rest.strip_prefix('"')?;
+                let j = rest.find('"')?;
+                return Some(rest[..j].to_string());
+            }
+        }
+        None
+    }
+
+    /// A `Decision::Deny` answer makes the mock agent error out and exit 1.
+    #[test]
+    fn deny_decision_makes_mock_exit_nonzero() {
+        let spec =
+            CommandSpec::new("python3", std::env::temp_dir()).arg(mock_agent().to_str().unwrap());
+        let mut runner = StreamJsonRunner::spawn(&spec).unwrap();
+
+        let mut buf = String::new();
+        let mut answered = false;
+        loop {
+            let chunk = runner.read().unwrap();
+            if chunk.is_empty() {
+                break; // EOF
+            }
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            if !answered {
+                if let Some(rid) = extract_request_id(&buf) {
+                    runner
+                        .answer(&rid, Decision::Deny("not allowed in test".into()))
+                        .unwrap();
+                    answered = true;
+                }
+            }
+        }
+
+        let code = runner.wait().unwrap();
+        assert!(answered, "should have observed a can_use_tool request");
+        assert_eq!(code, 1, "mock must exit 1 after deny");
+        assert!(buf.contains("denied"), "expected a denial result; stream: {buf}");
+        assert!(
+            !buf.contains("post-approval-tool-result"),
+            "agent must not proceed after deny; stream: {buf}"
+        );
     }
 }

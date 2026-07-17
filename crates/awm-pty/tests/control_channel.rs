@@ -12,12 +12,18 @@ fn mock_agent() -> PathBuf {
 }
 
 /// Extract the envelope `request_id` of a `can_use_tool` control_request line.
+///
+/// Tolerant of insignificant JSON whitespace after the colon so it matches both
+/// the compact form real `claude` emits (`"request_id":"…"`) and the
+/// pretty-printed form the Python mock fixture emits (`"request_id": "…"`).
 fn find_request_id(buf: &str) -> Option<String> {
     for line in buf.lines() {
         if line.contains("\"can_use_tool\"") {
-            let key = "\"request_id\":\"";
-            if let Some(i) = line.find(key) {
-                let rest = &line[i + key.len()..];
+            let anchor = "\"request_id\"";
+            if let Some(i) = line.find(anchor) {
+                let rest = line[i + anchor.len()..].trim_start();
+                let rest = rest.strip_prefix(':')?.trim_start();
+                let rest = rest.strip_prefix('"')?;
                 if let Some(j) = rest.find('"') {
                     return Some(rest[..j].to_string());
                 }
