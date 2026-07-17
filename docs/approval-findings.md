@@ -86,3 +86,24 @@ Extra confirmations:
 `awm-proto::ApprovalCtx` was updated (pre-freeze) to carry `tool`, `input`,
 `request_id`, `tool_use_id`, `description`, `decision_reason`. `fixtures/approval.jsonl`
 now uses this confirmed shape.
+
+## How awm makes live `claude` gate (Phase 3, verified 2026-07-17)
+
+The missing flag from the earlier manual attempts, found in the SDK source
+(`_internal/client.py`: `can_use_tool` → `permission_prompt_tool_name="stdio"`):
+
+```
+claude -p --output-format stream-json --verbose \
+       --input-format stream-json --permission-prompt-tool stdio
+```
+
+`--permission-prompt-tool stdio` routes approval gates to the controller over the
+stdio control channel as `can_use_tool` requests. Sequence awm's `StreamJsonRunner`
+performs: send an `initialize` control_request, then the user prompt; on
+`can_use_tool` reply with our `control_response`
+(`{"behavior":"allow","updatedInput":{}}` / `{"behavior":"deny","message":…}`).
+
+Verified end-to-end against CC 2.1.212 (`scratchpad/verify_live.py`): a `Write`
+outside the cwd gated, and our `allow` let the agent proceed
+(`GATE_FIRED=True, AGENT_PROCEEDED=True`, 0 denials). The `initialize` reply is a
+behavior-less `control_response`, which `awm-parser` maps to `Noise`.
