@@ -1,0 +1,11 @@
+[package]
+name = "awm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Event bus, agent registry, and layout engine for awm (integration). Phase 3."
+
+[dependencies]
+awm-proto = { workspace = true }
+tokio = { workspace = true }

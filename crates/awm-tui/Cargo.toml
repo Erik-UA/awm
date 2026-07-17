@@ -1,0 +1,15 @@
+[package]
+name = "awm-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Ratatui rendering + keymap for awm (Track C). Phase 2."
+
+[dependencies]
+awm-proto = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }

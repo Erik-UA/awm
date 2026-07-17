@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/awm-proto",
+    "crates/awm-pty",
+    "crates/awm-parser",
+    "crates/awm-tui",
+    "crates/awm-core",
+    "crates/awm",
+]
+
+# Pinned to versions that build under rustc 1.75 (edition 2021 only).
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.75"
+
+[workspace.dependencies]
+awm-proto = { path = "crates/awm-proto" }
+awm-pty = { path = "crates/awm-pty" }
+awm-parser = { path = "crates/awm-parser" }
+awm-tui = { path = "crates/awm-tui" }
+awm-core = { path = "crates/awm-core" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bitflags = { version = "2", features = ["serde"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "io-util", "time"] }
+portable-pty = "0.8"
+ratatui = "0.26"
+crossterm = "0.27"
+insta = { version = "1", features = ["json"] }
+# Pinned: proptest >=1.6 and its rand/getrandom stack bump MSRV past 1.75.
+proptest = "=1.5.0"

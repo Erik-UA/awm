@@ -1,0 +1,15 @@
+[package]
+name = "awm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "awm — agent window manager binary. Wires the crates together (Phase 3+)."
+
+[[bin]]
+name = "awm"
+path = "src/main.rs"
+
+[dependencies]
+awm-proto = { workspace = true }
+awm-core = { workspace = true }

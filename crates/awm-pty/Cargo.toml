@@ -1,0 +1,11 @@
+[package]
+name = "awm-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "PTY session management for awm (Track A). Phase 2."
+
+[dependencies]
+awm-proto = { workspace = true }
+portable-pty = { workspace = true }

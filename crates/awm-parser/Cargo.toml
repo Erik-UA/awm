@@ -1,0 +1,15 @@
+[package]
+name = "awm-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "stream-json to AgentEvent parser for awm (Track B). Phase 2."
+
+[dependencies]
+awm-proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
