@@ -54,6 +54,19 @@ fn lifecycle_through_approval_updates_state_and_pending() {
 }
 
 #[test]
+fn terminal_agent_absorbs_late_events_without_tail_noise() {
+    let (mut reg, ids) = reg_with(1);
+    reg.apply_event(ids[0], &AgentEvent::Finished { ok: true });
+    let tail_before = reg.record(ids[0]).unwrap().tail.len();
+    // The reader's EOF safety-net (`Finished{ok:false}`) after a clean finish
+    // must be fully absorbed — no state change, no spurious "failed" tail line.
+    reg.apply_event(ids[0], &AgentEvent::Finished { ok: false });
+    let rec = reg.record(ids[0]).unwrap();
+    assert_eq!(rec.state, AgentState::Done);
+    assert_eq!(rec.tail.len(), tail_before);
+}
+
+#[test]
 fn tokens_are_recorded() {
     let (mut reg, ids) = reg_with(1);
     reg.apply_event(ids[0], &AgentEvent::Tokens(TokenUsage { input: 100, output: 20 }));

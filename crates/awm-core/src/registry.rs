@@ -94,6 +94,11 @@ impl Registry {
         let mut stamped = false;
 
         if let Some(rec) = self.agents.get_mut(&id) {
+            // Terminal agents absorb everything — including tail side effects.
+            // (e.g. the reader's EOF `Finished{ok:false}` after a clean finish.)
+            if rec.state.is_terminal() {
+                return;
+            }
             rec.state = rec.state.apply(event);
 
             match event {
