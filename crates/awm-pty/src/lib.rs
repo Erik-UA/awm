@@ -212,18 +212,24 @@ pub enum Decision {
 /// The public API is synchronous; a small current-thread tokio runtime drives
 /// the async child process underneath.
 pub struct StreamJsonRunner {
-    rt: tokio::runtime::Runtime,
+    rt: Arc<tokio::runtime::Runtime>,
     child: tokio::process::Child,
-    stdin: tokio::process::ChildStdin,
     stdout: tokio::process::ChildStdout,
+    answerer: Answerer,
 }
 
 impl StreamJsonRunner {
     /// Spawn the agent with piped stdin/stdout in stream-json mode.
     pub fn spawn(spec: &CommandSpec) -> std::io::Result<Self> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
+        // A multi-thread runtime (one worker) so the reader thread and a
+        // separately-held [`Answerer`] can both `block_on` concurrently — the
+        // control-channel write must not deadlock behind a blocking `read`.
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()?,
+        );
 
         let (child, stdin, stdout) = rt.block_on(async {
             let mut cmd = tokio::process::Command::new(&spec.program);
@@ -246,21 +252,28 @@ impl StreamJsonRunner {
             Ok::<_, std::io::Error>((child, stdin, stdout))
         })?;
 
+        let answerer = Answerer {
+            rt: rt.clone(),
+            stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
+        };
+
         Ok(StreamJsonRunner {
             rt,
             child,
-            stdin,
             stdout,
+            answerer,
         })
+    }
+
+    /// A cheap `Send + Sync` handle to this agent's stdin, for answering
+    /// approvals / sending prompts from another thread while `read` blocks here.
+    pub fn answerer(&self) -> Answerer {
+        self.answerer.clone()
     }
 
     /// Send a user prompt as a stream-json input message.
     pub fn send_prompt(&mut self, text: &str) -> std::io::Result<()> {
-        let line = format!(
-            r#"{{"type":"user","message":{{"role":"user","content":"{}"}}}}"#,
-            json_escape(text)
-        );
-        self.write_line(&line)
+        self.answerer.send_prompt(text)
     }
 
     /// Read the next chunk of raw stdout bytes to feed the parser. Returns an
@@ -279,6 +292,29 @@ impl StreamJsonRunner {
     /// Answer a pending `can_use_tool` request (by envelope `request_id`) by
     /// writing the corresponding `control_response` line.
     pub fn answer(&mut self, request_id: &str, decision: Decision) -> std::io::Result<()> {
+        self.answerer.answer(request_id, decision)
+    }
+
+    /// Block until the agent exits and return its status code.
+    pub fn wait(&mut self) -> std::io::Result<i32> {
+        let StreamJsonRunner { rt, child, .. } = self;
+        let status = rt.block_on(async { child.wait().await })?;
+        Ok(status.code().unwrap_or(-1))
+    }
+}
+
+/// A `Send + Sync` handle to an agent's stdin. Held by the UI thread so it can
+/// answer approval gates and send prompts while the runner's `read` loop blocks
+/// on a reader thread. Cheap to clone (shares the runtime and stdin).
+#[derive(Clone)]
+pub struct Answerer {
+    rt: Arc<tokio::runtime::Runtime>,
+    stdin: Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,
+}
+
+impl Answerer {
+    /// Answer a pending `can_use_tool` request by its envelope `request_id`.
+    pub fn answer(&self, request_id: &str, decision: Decision) -> std::io::Result<()> {
         let inner = match decision {
             Decision::Allow => r#"{"behavior":"allow","updatedInput":{}}"#.to_string(),
             Decision::Deny(reason) => {
@@ -293,22 +329,25 @@ impl StreamJsonRunner {
         self.write_line(&line)
     }
 
-    /// Block until the agent exits and return its status code.
-    pub fn wait(&mut self) -> std::io::Result<i32> {
-        let StreamJsonRunner { rt, child, .. } = self;
-        let status = rt.block_on(async { child.wait().await })?;
-        Ok(status.code().unwrap_or(-1))
+    /// Send a user prompt as a stream-json input message.
+    pub fn send_prompt(&self, text: &str) -> std::io::Result<()> {
+        let line = format!(
+            r#"{{"type":"user","message":{{"role":"user","content":"{}"}}}}"#,
+            json_escape(text)
+        );
+        self.write_line(&line)
     }
 
     /// Write a single newline-terminated line to the agent's stdin and flush.
-    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+    fn write_line(&self, line: &str) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt;
-        let StreamJsonRunner { rt, stdin, .. } = self;
         let mut bytes = line.as_bytes().to_vec();
         bytes.push(b'\n');
-        rt.block_on(async {
-            stdin.write_all(&bytes).await?;
-            stdin.flush().await?;
+        let stdin = self.stdin.clone();
+        self.rt.block_on(async move {
+            let mut guard = stdin.lock().await;
+            guard.write_all(&bytes).await?;
+            guard.flush().await?;
             Ok(())
         })
     }
