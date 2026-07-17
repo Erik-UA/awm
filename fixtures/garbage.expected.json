@@ -1,0 +1,7 @@
+{
+  "note": "Robustness: a truncated line, a non-JSON log line, and an unknown event type are all mapped to Noise (no panic, no state change). Valid init/text/result still drive the machine to Done.",
+  "states": ["working", "done"],
+  "final_state": "done",
+  "approvals": [],
+  "final_tokens": { "input": 900, "output": 50 }
+}

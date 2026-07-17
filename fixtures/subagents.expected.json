@@ -1,0 +1,7 @@
+{
+  "note": "A Task tool spawns a subagent (nested assistant message carries parent_tool_use_id). Nested/extra messages must not break parsing; state stays Working until Done.",
+  "states": ["working", "done"],
+  "final_state": "done",
+  "approvals": [],
+  "final_tokens": { "input": 5820, "output": 220 }
+}

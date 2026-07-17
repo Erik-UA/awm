@@ -1,0 +1,7 @@
+{
+  "note": "THE killer scenario: agent blocks on a Bash approval, human allows, agent resumes and finishes. control_request/control_response shape is CONFIRMED against CC 2.1.212 (docs/approval-findings.md); comes from the control channel interleaved into the event log.",
+  "states": ["working", "blocked_on_approval", "working", "done"],
+  "final_state": "done",
+  "approvals": [{ "tool": "Bash", "request_id": "req_7" }],
+  "final_tokens": { "input": 2950, "output": 140 }
+}

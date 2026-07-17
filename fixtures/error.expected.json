@@ -1,0 +1,7 @@
+{
+  "note": "Tool fails and the run ends in error (is_error=true) -> Failed.",
+  "states": ["working", "failed"],
+  "final_state": "failed",
+  "approvals": [],
+  "final_tokens": { "input": 1620, "output": 75 }
+}

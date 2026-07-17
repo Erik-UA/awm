@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","cwd":"/home/dev/proj","session_id":"s-error","tools":["Bash","Read"],"model":"claude-opus-4-8","permissionMode":"default","apiKeySource":"none"}
+{"type":"assistant","message":{"id":"msg_1","role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"I'll run the build."}],"stop_reason":null,"usage":{"input_tokens":800,"output_tokens":25}},"session_id":"s-error"}
+{"type":"assistant","message":{"id":"msg_2","role":"assistant","model":"claude-opus-4-8","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo build"}}],"stop_reason":"tool_use","usage":{"input_tokens":820,"output_tokens":50}},"session_id":"s-error"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"error[E0433]: failed to resolve","is_error":true}]},"session_id":"s-error"}
+{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":6100,"duration_api_ms":2200,"num_turns":2,"result":"Build failed and could not be recovered.","total_cost_usd":0.008,"usage":{"input_tokens":1620,"output_tokens":75},"session_id":"s-error"}

@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","cwd":"/home/dev/proj","session_id":"s-garbage","tools":["Bash"],"model":"claude-opus-4-8","permissionMode":"default","apiKeySource":"none"}
+{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"text","tex
+this is not json at all — a stray log line leaked into the stream
+{"type":"mystery_event","subtype":"from_a_future_schema_version","foo":123}
+{"type":"assistant","message":{"id":"msg_2","role":"assistant","content":[{"type":"text","text":"Recovering after the noise."}],"usage":{"input_tokens":100,"output_tokens":10}},"session_id":"s-garbage"}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":3000,"num_turns":1,"result":"Finished despite noisy stream.","total_cost_usd":0.004,"usage":{"input_tokens":900,"output_tokens":50},"session_id":"s-garbage"}
