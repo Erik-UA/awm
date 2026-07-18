@@ -248,6 +248,7 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
     let mut mode = LayoutMode::Tiling;
     let mut input: Option<Input> = None;
     let mut scroll: u16 = 0; // focused pane's scrollback offset (0 = follow bottom)
+    let mut prev_focus: Option<AgentId> = None; // to snap to bottom on focus change
     let mut show_card = false; // agent inspection card toggle
 
     loop {
@@ -258,10 +259,12 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
                     match key.code {
                         KeyCode::Enter => match input.take() {
                             Some(Input::Spawn(text)) if !text.is_empty() => {
-                                spawn_typed(&mut engine, &spawn_kind, text)
+                                spawn_typed(&mut engine, &spawn_kind, text);
+                                scroll = 0; // snap to the newest output
                             }
                             Some(Input::Message(id, text)) if !text.is_empty() => {
                                 let _ = engine.send_message(id, &text);
+                                scroll = 0; // snap to the reply as it arrives
                             }
                             _ => {}
                         },
@@ -317,6 +320,9 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
                                     Action::ScrollBottom => scroll = 0,
                                     Action::Inspect => show_card = !show_card,
                                     other => {
+                                        // Any non-scroll action snaps the pane back
+                                        // to the newest output.
+                                        scroll = 0;
                                         handle_action(other, &mut engine, &mut mode, &spawn_kind)
                                     }
                                 }
@@ -329,16 +335,33 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
 
         engine.pump();
         let layout = plan_layout(engine.registry(), mode);
+        let views = engine.registry().views();
         let focus = engine.registry().focus();
+
+        // Snap to the newest output whenever focus moves to a different pane.
+        if focus != prev_focus {
+            scroll = 0;
+            prev_focus = focus;
+        }
+        // Clamp the scrollback offset to the focused pane's content so it can't run
+        // away (ScrollTop = u16::MAX collapses to the top; nothing underflows). The
+        // exact viewport clamp happens in the renderer; this bound just keeps the
+        // stored offset proportional to available scrollback. One transcript line
+        // maps to at least one row, so summing line counts is a safe upper bound.
+        let max_scroll = focus
+            .and_then(|id| views.iter().find(|v| v.meta.id == id))
+            .map(|v| {
+                v.tail
+                    .iter()
+                    .map(|tl| tl.text.lines().count().max(1))
+                    .sum::<usize>()
+            })
+            .unwrap_or(0)
+            .min(u16::MAX as usize) as u16;
+        scroll = scroll.min(max_scroll);
+
         let bar = input.as_ref().map(|i| i.bar());
-        tui.draw(
-            &engine.registry().views(),
-            &layout,
-            focus,
-            bar.as_deref(),
-            scroll,
-            show_card,
-        )?;
+        tui.draw(&views, &layout, focus, bar.as_deref(), scroll, show_card)?;
     }
     engine.shutdown();
     Ok(())
