@@ -36,8 +36,9 @@ window types out live like a real Claude session.
 
 Press `y` to approve the master agent, `n` to deny — the response goes back over
 the agent's control channel and it resumes. No entering the session. Press `i` to
-send a follow-up message to the focused agent and watch its reply in the window
-(a live, multi-turn conversation over stream-json input).
+send a follow-up message to the focused agent and watch its reply in the window —
+agents run as **persistent** sessions, so you can hold a real multi-turn
+conversation (`awm --claude "…"` then keep talking with `i`).
 
 ## Quick start
 
