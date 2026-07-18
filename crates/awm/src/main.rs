@@ -194,6 +194,13 @@ fn main() -> std::io::Result<()> {
         return run_demo();
     }
 
+    // Headless diagnostic: `--probe-subagent <prompt>` spawns a live claude, drives
+    // it through a sub-agent approval, and prints which pane each gate lands on.
+    if let Some(pos) = args.iter().position(|a| a == "--probe-subagent") {
+        let prompt = args.get(pos + 1).cloned().unwrap_or_default();
+        return run_probe_subagent(prompt);
+    }
+
     // Build the initial roster: --claude <prompt> (repeatable), else mock agents.
     let mut roster: Vec<Spawn> = Vec::new();
     let mut it = args.iter();
@@ -247,6 +254,73 @@ fn run_demo() -> std::io::Result<()> {
     println!("\n── approved from the bar → agents resumed and finished ──");
     print!("{}", frame_text(tui.backend()));
 
+    engine.join();
+    Ok(())
+}
+
+/// Headless probe for sub-agent approval routing on a LIVE claude. Spawns one
+/// claude with `prompt`, then pumps for up to ~120s, printing every pane and which
+/// one holds a pending gate each time the blocked set changes, auto-approving each
+/// gate so the flow continues. Run with `AWM_CAPTURE_DIR=captures` to also dump the
+/// raw stream to `captures/agent-<id>.jsonl`. Prints, never renders a TUI.
+fn run_probe_subagent(prompt: String) -> std::io::Result<()> {
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    let mut engine = Engine::new();
+    let (spec, prompt, handshake, persistent) = spec_for(&Spawn::Claude(prompt));
+    engine.spawn(spec, "root", Tags::empty(), prompt, handshake, persistent)?;
+
+    let start = Instant::now();
+    let mut answered: HashSet<String> = HashSet::new();
+    let mut last_snapshot = String::new();
+
+    println!("── probe: driving a live claude through sub-agent approvals ──");
+    while start.elapsed() < Duration::from_secs(120) {
+        engine.pump_blocking(Duration::from_millis(200));
+
+        // Snapshot every pane + its pending gate; print only when it changes.
+        let mut snapshot = String::new();
+        for v in engine.registry().views() {
+            let pending = engine
+                .registry()
+                .record(v.meta.id)
+                .and_then(|r| r.pending.as_ref())
+                .map(|c| format!(" GATE tool={} req={}", c.tool, c.request_id))
+                .unwrap_or_default();
+            snapshot.push_str(&format!(
+                "  @{} {:?} state={:?}{}\n",
+                v.meta.id.0, v.meta.name, v.state, pending
+            ));
+        }
+        if snapshot != last_snapshot {
+            println!("── t={:?} ──\n{}", start.elapsed(), snapshot);
+            last_snapshot = snapshot;
+        }
+
+        // Auto-approve any new gate (by request_id, once) so the flow proceeds.
+        let blocked: Vec<AgentId> = engine.registry().blocked_ordered();
+        for id in blocked {
+            if let Some(req) = engine.registry().pending_request_id(id) {
+                if answered.insert(req.clone()) {
+                    let name = engine
+                        .registry()
+                        .record(id)
+                        .map(|r| r.meta.name.clone())
+                        .unwrap_or_default();
+                    println!("  -> approving gate req={req} on pane @{} {name:?}", id.0);
+                    let _ = engine.answer(id, Decision::Allow);
+                }
+            }
+        }
+
+        if engine.registry().all_terminal() {
+            println!("── all agents terminal ──");
+            break;
+        }
+    }
+    println!("── probe done (t={:?}, {} gate(s) approved) ──", start.elapsed(), answered.len());
+    engine.shutdown();
     engine.join();
     Ok(())
 }

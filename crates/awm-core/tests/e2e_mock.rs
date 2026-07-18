@@ -304,3 +304,63 @@ fn denying_makes_the_agent_fail() {
 
     engine.join();
 }
+
+/// Real-shape sub-agent approval routing: a parent that spawns two background
+/// sub-agents (via the `Agent` tool) whose inner Bash calls each raise a
+/// `can_use_tool` gate. Each gate must land in its OWN sub-agent pane (correlated
+/// by the gate's `tool_use_id`), never colliding on the root. Mirrors the live
+/// claude capture frozen in `fixtures/subagent-approval.jsonl`.
+#[test]
+fn subagent_gates_route_to_child_panes_not_root() {
+    let mut engine = Engine::new();
+    // Persistent: the mock ends its turn (result → TurnEnded) while the sub-agents
+    // stay blocked; the child panes must survive that.
+    let root = engine
+        .spawn(script_spec("mock-subagents.py"), "root", Tags::empty(), None, false, true)
+        .unwrap();
+
+    // Both sub-agent panes appear and each blocks on its OWN gate.
+    let ready = pump_until(&mut engine, |e| {
+        let subs: Vec<AgentId> = e
+            .registry()
+            .order()
+            .iter()
+            .copied()
+            .filter(|id| *id != root)
+            .collect();
+        subs.len() == 2
+            && subs
+                .iter()
+                .all(|id| e.registry().pending_request_id(*id).is_some())
+    });
+    assert!(ready, "both sub-agent panes should block on their own gate");
+
+    // The root (parent) is NOT the one holding a gate.
+    assert!(
+        engine.registry().pending_request_id(root).is_none(),
+        "gates must not collide on the root pane"
+    );
+
+    let subs: Vec<AgentId> = engine
+        .registry()
+        .order()
+        .iter()
+        .copied()
+        .filter(|id| *id != root)
+        .collect();
+    let r0 = engine.registry().pending_request_id(subs[0]).unwrap();
+    let r1 = engine.registry().pending_request_id(subs[1]).unwrap();
+    assert_ne!(r0, r1, "each sub-agent pane holds a distinct request_id");
+
+    // Answering one child clears only its block (the answer is routed to the root
+    // process's control channel with the child's own request_id).
+    engine.answer(subs[0], Decision::Allow).unwrap();
+    assert!(engine.registry().pending_request_id(subs[0]).is_none());
+    assert!(
+        engine.registry().pending_request_id(subs[1]).is_some(),
+        "answering one sub-agent must not resolve the other"
+    );
+
+    engine.shutdown();
+    engine.join();
+}

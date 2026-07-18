@@ -1,0 +1,10 @@
+{
+  "note": "Real live-claude shape (v2.1.214): a parent launches two background subagents via the `Agent` tool; each subagent's inner Bash streams with a TOP-LEVEL parent_tool_use_id, then raises a `can_use_tool` gate whose envelope has NO parent_tool_use_id but carries request.tool_use_id (= the inner Bash id) and request.agent_id. The flat parser must survive this and surface both gates.",
+  "states": ["working", "blocked_on_approval", "working", "blocked_on_approval", "working", "done"],
+  "final_state": "done",
+  "approvals": [
+    { "tool": "Bash", "request_id": "req-1" },
+    { "tool": "Bash", "request_id": "req-2" }
+  ],
+  "final_tokens": { "input": 5820, "output": 220 }
+}

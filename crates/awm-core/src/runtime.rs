@@ -20,6 +20,16 @@ use std::time::Duration;
 /// this prefix to style a sub-agent pane (keep it in sync with awm-tui).
 pub const SUBAGENT_PREFIX: &str = "\u{21b3} "; // "↳ "
 
+/// Open the per-agent raw-capture file when `AWM_CAPTURE_DIR` is set, else `None`.
+/// Diagnostic only: dumps the verbatim stdout stream for `id` to
+/// `<AWM_CAPTURE_DIR>/agent-<id>.jsonl` (created, truncated). Best-effort.
+fn capture_file(id: AgentId) -> Option<std::fs::File> {
+    let dir = std::env::var_os("AWM_CAPTURE_DIR")?;
+    let dir = std::path::PathBuf::from(dir);
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::File::create(dir.join(format!("agent-{}.jsonl", id.0))).ok()
+}
+
 /// An event tagged with the agent (process) it came from, plus sub-agent routing
 /// pulled off the stream out-of-band (see [`awm_parser::Routed`]).
 pub struct CoreEvent {
@@ -121,10 +131,21 @@ impl Engine {
         let tx = self.tx.clone();
         let handle = std::thread::spawn(move || {
             let mut parser = StreamParser::new();
+            // Optional raw-stream capture for diagnostics: when `AWM_CAPTURE_DIR`
+            // is set, tee every raw stdout chunk (verbatim, pre-parse) to
+            // `<dir>/agent-<id>.jsonl`. All of one process's bytes — including its
+            // sub-agents' interleaved frames — land in one file: exactly what the
+            // parser/router saw. Best-effort; capture errors never disturb the run.
+            let mut capture = capture_file(id);
             loop {
                 match runner.read() {
                     Ok(chunk) if chunk.is_empty() => break, // EOF
                     Ok(chunk) => {
+                        if let Some(f) = capture.as_mut() {
+                            use std::io::Write;
+                            let _ = f.write_all(&chunk);
+                            let _ = f.flush();
+                        }
                         parser.feed(&chunk);
                         while let Some(routed) = parser.next_routed() {
                             // For a persistent agent a per-turn `result` is not

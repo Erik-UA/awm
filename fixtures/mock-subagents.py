@@ -41,12 +41,14 @@ def nested_tool(parent_id, tool_id, command):
                "input": {"command": command}}]}})
 
 
-def gate(request_id, tool_id, command):
-    # can_use_tool: correlated to the pane only by request.tool_use_id.
+def gate(request_id, tool_id, command, agent_id):
+    # can_use_tool: the real envelope has NO parent_tool_use_id — only
+    # request.tool_use_id (= the inner tool's id, our routing key) and a direct
+    # request.agent_id handle. awm correlates by tool_use_id.
     emit({"type": "control_request", "request_id": request_id, "request": {
         "subtype": "can_use_tool", "tool_name": "Bash",
         "input": {"command": command}, "description": command,
-        "tool_use_id": tool_id}})
+        "tool_use_id": tool_id, "agent_id": agent_id}})
 
 
 emit({"type": "system", "subtype": "init", "permissionMode": "default",
@@ -60,14 +62,14 @@ time.sleep(0.6)
 spawn("toolu_1", "run parser tests", "cargo test -p awm-parser")
 time.sleep(0.6)
 nested_tool("toolu_1", "toolu_b1", "cargo test -p awm-parser")
-gate("req-1", "toolu_b1", "cargo test -p awm-parser")
+gate("req-1", "toolu_b1", "cargo test -p awm-parser", "agent-aaa1")
 time.sleep(0.7)
 
 # Second sub-agent, in parallel: spawn → inner Bash → its approval gate.
 spawn("toolu_2", "run core tests", "cargo test -p awm-core")
 time.sleep(0.6)
 nested_tool("toolu_2", "toolu_b2", "cargo test -p awm-core")
-gate("req-2", "toolu_b2", "cargo test -p awm-core")
+gate("req-2", "toolu_b2", "cargo test -p awm-core", "agent-bbb2")
 
 # The parent ends its turn while the sub-agents keep working in the background
 # (a `result` on a persistent session → TurnEnded, not session end). The child

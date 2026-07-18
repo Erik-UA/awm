@@ -110,6 +110,11 @@ fn subagents() {
 }
 
 #[test]
+fn subagent_approval() {
+    run_fixture("subagent-approval");
+}
+
+#[test]
 fn garbage_is_robust() {
     run_fixture("garbage");
 }
