@@ -19,6 +19,18 @@ status bar without hunting for it.
 └──────────────────────────────────────────────────────────┘└──────────────────────────────┘
 ```
 
+Each window reads like Claude Code itself — `⏺` tool calls with their arguments,
+indented `⎿` tool output, and markdown answers (headers, bullets, code):
+
+```
+⏺ Bash(ls -la)
+⎿ total 8
+    src
+    Cargo.toml
+## Summary
+• 2 entries, incl. a `src` directory
+```
+
 Press `y` to approve the master agent, `n` to deny — the response goes back over
 the agent's control channel and it resumes. No entering the session. Press `i` to
 send a follow-up message to the focused agent and watch its reply in the window
