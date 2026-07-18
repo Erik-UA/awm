@@ -150,6 +150,54 @@ fn monocle_full_screens_one_agent() {
     insta::assert_snapshot!("monocle", buffer_to_string(tui.backend()));
 }
 
+/// A pane whose transcript is taller than the pane must autoscroll: the *newest*
+/// lines are shown and the oldest scroll off the top. Focusing and scrolling back
+/// (a positive offset) reveals the older lines again.
+#[test]
+fn tall_transcript_autoscrolls_to_bottom() {
+    // 30 numbered lines (L00..L29) in a pane far too short to show them all.
+    let tail: Vec<TranscriptLine> = (0..30)
+        .map(|i| tl(LineKind::System, &format!("L{i:02}")))
+        .collect();
+    let views = vec![AgentView {
+        meta: AgentMeta {
+            id: AgentId(0),
+            name: "worker".into(),
+            tags: Tags::empty(),
+            cwd: "/p".into(),
+            started_at: 0,
+            urgent: false,
+        },
+        state: AgentState::Working,
+        tokens: TokenUsage::default(),
+        info: None,
+        tail,
+    }];
+
+    // Default (scroll == 0) follows the bottom: the last line is visible, the
+    // first is not.
+    let mut tui = AwmTui::new(TestBackend::new(40, 12)).unwrap();
+    tui.render(&views, &LayoutCmd::Monocle(AgentId(0))).unwrap();
+    let bottom = buffer_to_string(tui.backend());
+    assert!(bottom.contains("L29"), "newest line must be visible:\n{bottom}");
+    assert!(!bottom.contains("L00"), "oldest line must be scrolled off:\n{bottom}");
+
+    // Focused + scrolled back reveals the older lines and hides the newest.
+    let mut tui = AwmTui::new(TestBackend::new(40, 12)).unwrap();
+    tui.draw(
+        &views,
+        &LayoutCmd::Monocle(AgentId(0)),
+        Some(AgentId(0)),
+        None,
+        u16::MAX, // ScrollTop — clamps to the very top.
+        false,
+    )
+    .unwrap();
+    let top = buffer_to_string(tui.backend());
+    assert!(top.contains("L00"), "oldest line must be visible at the top:\n{top}");
+    assert!(!top.contains("L29"), "newest line must be off-screen at the top:\n{top}");
+}
+
 #[test]
 fn triage_shows_only_listed_agents_in_order() {
     let mut tui = AwmTui::new(TestBackend::new(80, 24)).unwrap();

@@ -219,9 +219,8 @@ fn draw_stack(
 /// PTY tail. Urgent agents get a red, bold, `!`-marked frame so they stand out
 /// even in a style-blind (symbol-only) snapshot.
 fn draw_pane(frame: &mut Frame, view: &AgentView, focused: bool, scroll: u16, area: Rect) {
-    // Scroll offset applies only to the focused pane (Track A implements the
-    // autoscroll / scrollback math using this).
-    let _scroll_off = if focused { scroll } else { 0 };
+    // Scroll offset applies only to the focused pane; see the bottom-follow math
+    // below. The offset is consumed there.
     let urgent = view.is_urgent();
     // Urgent (red) wins over focus (cyan); a `▸` marker makes focus visible in a
     // style-blind snapshot. With no focused pane the output is unchanged.
@@ -244,12 +243,24 @@ fn draw_pane(frame: &mut Frame, view: &AgentView, focused: bool, scroll: u16, ar
         .title(Span::styled(title, style));
 
     let inner = area.width.saturating_sub(2) as usize; // width inside the border
+    let visible = area.height.saturating_sub(2) as usize; // rows inside the border
     let body: Vec<Line> = view
         .tail
         .iter()
         .flat_map(|tl| render_transcript_line(tl, inner))
         .collect();
-    frame.render_widget(Paragraph::new(body).block(block), area);
+    // Bottom-follow: with no scrollback offset, pin the viewport to the newest
+    // lines (the last `visible` rows). One `Line` is treated as one row; the
+    // `Paragraph` clips anything wider. When the body fits, `max_off` is 0 and the
+    // scroll is a no-op — so panes that fit render identically to before.
+    let max_off = body.len().saturating_sub(visible);
+    // PgUp raises `scroll` to reveal older lines; PgDn / scroll == 0 returns to the
+    // bottom. Only the focused pane honours the offset; others always follow.
+    let scroll_off = if focused { scroll as usize } else { 0 };
+    let y = max_off
+        .saturating_sub(scroll_off)
+        .min(u16::MAX as usize) as u16;
+    frame.render_widget(Paragraph::new(body).block(block).scroll((y, 0)), area);
 }
 
 /// A placeholder pane when there is nothing to show.
