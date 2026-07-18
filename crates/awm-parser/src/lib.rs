@@ -74,6 +74,7 @@ impl StreamParser {
         match value.get("type").and_then(Value::as_str) {
             Some("system") => self.parse_system(&value),
             Some("assistant") => self.parse_assistant(&value),
+            Some("stream_event") => self.parse_stream_event(&value),
             Some("user") => self.parse_user(&value),
             Some("control_request") => self.parse_control_request(&value),
             Some("control_response") => self.parse_control_response(&value),
@@ -144,6 +145,27 @@ impl StreamParser {
             self.ready
                 .push_back(AgentEvent::Tokens(token_usage(usage)));
         }
+    }
+
+    /// A `stream_event` frame wraps a raw Anthropic streaming event
+    /// (`--include-partial-messages`). We surface text deltas as `MessageDelta`;
+    /// other stream events (block start/stop, message deltas) carry no line.
+    fn parse_stream_event(&mut self, value: &Value) {
+        let inner = value.get("event");
+        let inner_type = inner.and_then(|e| e.get("type")).and_then(Value::as_str);
+        if inner_type == Some("content_block_delta") {
+            let delta = inner.and_then(|e| e.get("delta"));
+            if delta.and_then(|d| d.get("type")).and_then(Value::as_str) == Some("text_delta") {
+                let text = delta
+                    .and_then(|d| d.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.ready.push_back(AgentEvent::MessageDelta { text });
+                return;
+            }
+        }
+        self.ready.push_back(AgentEvent::Noise);
     }
 
     /// A `user` frame carries tool results (the output of the agent's tools).
@@ -343,6 +365,18 @@ mod tests {
             output: "total 4\nfile".into(),
             is_error: false,
         }));
+    }
+
+    #[test]
+    fn stream_event_text_delta_becomes_message_delta() {
+        let mut p = StreamParser::new();
+        p.feed(br#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}}
+{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}
+"#);
+        let events: Vec<_> = std::iter::from_fn(|| p.next_event()).collect();
+        assert!(events.contains(&AgentEvent::MessageDelta { text: "Hel".into() }));
+        // Non-text stream events are inert Noise.
+        assert!(events.contains(&AgentEvent::Noise));
     }
 
     #[test]

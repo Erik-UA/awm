@@ -181,6 +181,29 @@ fn multi_turn_dialogue_shows_replies_in_the_window() {
 }
 
 #[test]
+fn streamed_reply_finalizes_to_single_line() {
+    let mut engine = Engine::new();
+    let id = engine
+        .spawn(script_spec("mock-stream.py"), "s", Tags::empty(), None, false)
+        .unwrap();
+
+    assert!(pump_until(&mut engine, |e| e.registry().all_terminal()));
+
+    let rec = engine.registry().record(id).unwrap();
+    let text_lines: Vec<&str> = rec
+        .tail
+        .iter()
+        .filter(|l| l.kind == LineKind::Text)
+        .map(|l| l.text.as_str())
+        .collect();
+    // Streamed then finalized: exactly one Text line with the whole reply, not
+    // one per chunk and not doubled by the final complete message.
+    assert_eq!(text_lines, vec!["Hello world, streamed live!"]);
+
+    engine.join();
+}
+
+#[test]
 fn work_agent_renders_tool_call_result_and_markdown() {
     let mut engine = Engine::new();
     let id = engine

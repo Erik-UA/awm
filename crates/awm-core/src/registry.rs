@@ -27,6 +27,8 @@ pub struct AgentRecord {
     pub blocked_since: Option<u64>,
     /// The pending approval context while blocked (carries the `request_id`).
     pub pending: Option<ApprovalCtx>,
+    /// Whether the last tail line is an in-progress streamed reply.
+    streaming: bool,
 }
 
 impl AgentRecord {
@@ -83,6 +85,7 @@ impl Registry {
                 tail: VecDeque::new(),
                 blocked_since: None,
                 pending: None,
+                streaming: false,
             },
         );
         self.order.push(id);
@@ -120,8 +123,42 @@ impl Registry {
                 _ => {}
             }
 
-            for line in transcript_lines(event) {
-                rec.push_line(line);
+            // Transcript, with live streaming of the in-progress reply.
+            match event {
+                // Grow the live reply line token-by-token.
+                AgentEvent::MessageDelta { text } => {
+                    if !rec.streaming {
+                        rec.push_line(TranscriptLine::new(LineKind::Text, String::new()));
+                        rec.streaming = true;
+                    }
+                    if let Some(last) = rec.tail.back_mut() {
+                        last.text.push_str(text);
+                    }
+                }
+                // The complete message finalizes (replaces) the streamed line;
+                // without prior streaming it is just appended.
+                AgentEvent::Message { text } => {
+                    if rec.streaming {
+                        if let Some(last) = rec.tail.back_mut() {
+                            last.text = text.trim().to_string();
+                        }
+                        rec.streaming = false;
+                    } else {
+                        for line in transcript_lines(event) {
+                            rec.push_line(line);
+                        }
+                    }
+                }
+                // Invisible events must NOT disturb an in-progress stream — the
+                // stream's block-start/stop frames arrive as Noise between deltas.
+                AgentEvent::Noise | AgentEvent::Tokens(_) | AgentEvent::Thinking => {}
+                // Any real line commits the live stream, then records itself.
+                other => {
+                    rec.streaming = false;
+                    for line in transcript_lines(other) {
+                        rec.push_line(line);
+                    }
+                }
             }
         }
 

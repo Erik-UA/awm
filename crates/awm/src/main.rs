@@ -32,6 +32,8 @@ enum Spawn {
     MockChat,
     /// A mock that does tool work + markdown (for the Claude-style demo).
     MockWork,
+    /// A mock that streams its reply token-by-token (for the streaming demo).
+    MockStream,
     Claude(String),
 }
 
@@ -94,6 +96,16 @@ fn spec_for(kind: &Spawn) -> (CommandSpec, Option<String>, bool) {
                 false,
             )
         }
+        Spawn::MockStream => {
+            let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/mock-stream.py");
+            (
+                CommandSpec::new("python3", std::env::temp_dir())
+                    .arg(script.to_string_lossy().to_string()),
+                None,
+                false,
+            )
+        }
         Spawn::Claude(prompt) => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
             // `--permission-prompt-tool stdio` routes approval gates to us over the
@@ -106,7 +118,9 @@ fn spec_for(kind: &Spawn) -> (CommandSpec, Option<String>, bool) {
                 .arg("stream-json")
                 .arg("--verbose")
                 .arg("--permission-prompt-tool")
-                .arg("stdio");
+                .arg("stdio")
+                // Stream the reply token-by-token into the window.
+                .arg("--include-partial-messages");
             (spec, Some(prompt.clone()), true)
         }
     }
@@ -132,6 +146,7 @@ fn main() -> std::io::Result<()> {
             "--mock" => roster.push(Spawn::Mock),
             "--chat" => roster.push(Spawn::MockChat),
             "--work" => roster.push(Spawn::MockWork),
+            "--stream" => roster.push(Spawn::MockStream),
             _ => {}
         }
     }
@@ -181,6 +196,7 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
             Spawn::Mock => format!("mock-{i}"),
             Spawn::MockChat => format!("chat-{i}"),
             Spawn::MockWork => format!("work-{i}"),
+            Spawn::MockStream => format!("stream-{i}"),
             Spawn::Claude(_) => format!("claude-{i}"),
         };
         engine.spawn(spec, name, Tags::empty(), prompt, handshake)?;
@@ -274,6 +290,7 @@ fn spawn_typed(engine: &mut Engine, kind: &Spawn, text: String) {
         Spawn::Claude(_) => Spawn::Claude(text),
         Spawn::MockChat => Spawn::MockChat,
         Spawn::MockWork => Spawn::MockWork,
+        Spawn::MockStream => Spawn::MockStream,
         Spawn::Mock => Spawn::Mock,
     };
     let (spec, prompt, handshake) = spec_for(&spawn);

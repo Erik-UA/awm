@@ -24,6 +24,10 @@ pub enum AgentEvent {
     Thinking,
     /// Assistant output text, to show in the agent's window (enables dialogue).
     Message { text: String },
+    /// A streamed chunk of the in-progress assistant reply (from
+    /// `--include-partial-messages`). Appended live; the final `Message`
+    /// replaces the accumulated chunks.
+    MessageDelta { text: String },
     /// The agent began invoking a tool. `summary` is a one-line preview of the
     /// tool input (e.g. the Bash command, or an edited file's path).
     ToolStarted { name: String, summary: String },

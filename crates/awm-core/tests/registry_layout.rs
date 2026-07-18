@@ -1,7 +1,7 @@
 //! Unit tests for the registry model and the pure layout engine.
 
 use awm_core::{plan_layout, LayoutMode, Registry};
-use awm_proto::{AgentEvent, AgentId, AgentMeta, AgentState, ApprovalCtx, LayoutCmd, TokenUsage};
+use awm_proto::{AgentEvent, AgentId, AgentMeta, AgentState, ApprovalCtx, LayoutCmd, LineKind, TokenUsage};
 
 fn ctx(request_id: &str, tool: &str) -> ApprovalCtx {
     ApprovalCtx {
@@ -64,6 +64,30 @@ fn terminal_agent_absorbs_late_events_without_tail_noise() {
     let rec = reg.record(ids[0]).unwrap();
     assert_eq!(rec.state, AgentState::Done);
     assert_eq!(rec.tail.len(), tail_before);
+}
+
+#[test]
+fn streamed_deltas_grow_one_line_and_finalize_without_duplication() {
+    let (mut reg, ids) = reg_with(1);
+    let a = ids[0];
+    reg.apply_event(a, &AgentEvent::Started { model: "m".into(), cwd: "/".into() });
+    let base = reg.record(a).unwrap().tail.len();
+
+    // Deltas (interleaved with the Noise the stream emits between blocks).
+    for chunk in ["Hel", "lo ", "world"] {
+        reg.apply_event(a, &AgentEvent::Noise); // e.g. content_block_start/stop
+        reg.apply_event(a, &AgentEvent::MessageDelta { text: chunk.into() });
+    }
+    // Exactly one new (live) line that has grown.
+    assert_eq!(reg.record(a).unwrap().tail.len(), base + 1);
+    let live = reg.record(a).unwrap().tail.back().unwrap();
+    assert_eq!(live.kind, LineKind::Text);
+    assert_eq!(live.text, "Hello world");
+
+    // The complete message finalizes it — no duplicate line appended.
+    reg.apply_event(a, &AgentEvent::Message { text: "Hello world".into() });
+    assert_eq!(reg.record(a).unwrap().tail.len(), base + 1);
+    assert_eq!(reg.record(a).unwrap().tail.back().unwrap().text, "Hello world");
 }
 
 #[test]
