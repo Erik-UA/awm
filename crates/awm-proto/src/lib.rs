@@ -25,4 +25,4 @@ pub use layout::LayoutCmd;
 pub use meta::{AgentId, AgentMeta, Tags};
 pub use state::AgentState;
 pub use traits::{EventSource, Renderer};
-pub use view::AgentView;
+pub use view::{AgentView, LineKind, TranscriptLine};

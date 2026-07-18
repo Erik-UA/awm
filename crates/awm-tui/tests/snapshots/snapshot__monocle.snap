@@ -3,8 +3,8 @@ source: crates/awm-tui/tests/snapshot.rs
 expression: buffer_to_string(tui.backend())
 ---
 ┌@0 builder [#1] working 3600tok───────────────────────────────────────────────┐
-│compiling awm-core                                                            │
-│Finished dev                                                                  │
+│⏺ Bash(cargo build)                                                           │
+│⎿ Finished dev                                                                │
 │                                                                              │
 │                                                                              │
 │                                                                              │

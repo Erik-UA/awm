@@ -80,7 +80,7 @@ fn terminal_states_absorb_everything() {
             cwd: "/".into(),
         },
         AgentEvent::Thinking,
-        AgentEvent::ToolStarted { name: "Edit".into() },
+        AgentEvent::ToolStarted { name: "Edit".into(), summary: "f.txt".into() },
         approval(),
         AgentEvent::ApprovalResolved { approved: true },
         AgentEvent::Finished { ok: true },
@@ -101,7 +101,7 @@ fn thinking_and_tool_keep_agent_working() {
         AgentState::Working
     );
     assert_eq!(
-        AgentState::Working.apply(&AgentEvent::ToolStarted { name: "Read".into() }),
+        AgentState::Working.apply(&AgentEvent::ToolStarted { name: "Read".into(), summary: "f.txt".into() }),
         AgentState::Working
     );
 }
@@ -129,7 +129,7 @@ fn arb_event() -> impl Strategy<Value = AgentEvent> {
     prop_oneof![
         Just(AgentEvent::Thinking),
         Just(AgentEvent::Noise),
-        Just(AgentEvent::ToolStarted { name: "T".into() }),
+        Just(AgentEvent::ToolStarted { name: "T".into(), summary: "s".into() }),
         Just(approval()),
         any::<bool>().prop_map(|approved| AgentEvent::ApprovalResolved { approved }),
         any::<bool>().prop_map(|ok| AgentEvent::Finished { ok }),

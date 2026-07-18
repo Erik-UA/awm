@@ -5,20 +5,23 @@
 //! layout engine can promote the oldest-blocked agent to the master zone.
 
 use awm_proto::{
-    AgentEvent, AgentId, AgentMeta, AgentState, AgentView, ApprovalCtx, Tags, TokenUsage,
+    AgentEvent, AgentId, AgentMeta, AgentState, AgentView, ApprovalCtx, LineKind, Tags,
+    TokenUsage, TranscriptLine,
 };
 use std::collections::{HashMap, VecDeque};
 
-/// How many recent output lines to keep per agent for the pane body.
-const TAIL_CAP: usize = 200;
+/// How many recent transcript lines to keep per agent for the pane body.
+const TAIL_CAP: usize = 400;
+/// Cap on how many lines of a single tool result to show (Claude-style).
+const TOOL_RESULT_LINES: usize = 8;
 
 /// Everything the core tracks for one agent.
 pub struct AgentRecord {
     pub meta: AgentMeta,
     pub state: AgentState,
     pub tokens: TokenUsage,
-    /// Recent output lines (ring, oldest first).
-    pub tail: VecDeque<String>,
+    /// Recent transcript lines (ring, oldest first).
+    pub tail: VecDeque<TranscriptLine>,
     /// Logical wait order when blocked (lower = waiting longer); `None` unless
     /// currently `BlockedOnApproval`.
     pub blocked_since: Option<u64>,
@@ -36,7 +39,7 @@ impl AgentRecord {
         }
     }
 
-    fn push_tail(&mut self, line: String) {
+    fn push_line(&mut self, line: TranscriptLine) {
         self.tail.push_back(line);
         while self.tail.len() > TAIL_CAP {
             self.tail.pop_front();
@@ -117,8 +120,8 @@ impl Registry {
                 _ => {}
             }
 
-            if let Some(line) = describe(event) {
-                rec.push_tail(line);
+            for line in transcript_lines(event) {
+                rec.push_line(line);
             }
         }
 
@@ -172,7 +175,7 @@ impl Registry {
     /// message in a dialogue). No state change.
     pub fn push_note(&mut self, id: AgentId, line: String) {
         if let Some(rec) = self.agents.get_mut(&id) {
-            rec.push_tail(line);
+            rec.push_line(TranscriptLine::new(LineKind::Note, line));
         }
     }
 
@@ -215,28 +218,66 @@ impl Registry {
     }
 }
 
-/// A short human-readable tail line for an event, or `None` to record nothing.
-fn describe(event: &AgentEvent) -> Option<String> {
+/// Turn an event into the transcript line(s) shown in the agent's window,
+/// formatted like Claude Code (glyphs baked in; the TUI adds only color and
+/// markdown styling). `Thinking`/`Tokens`/`Noise` record nothing.
+fn transcript_lines(event: &AgentEvent) -> Vec<TranscriptLine> {
+    use LineKind as K;
     match event {
-        AgentEvent::Started { model, .. } => Some(format!("● session started ({model})")),
-        // The agent's actual reply — the thing you read in its window.
+        AgentEvent::Started { model, .. } => {
+            vec![TranscriptLine::new(K::System, format!("● session started ({model})"))]
+        }
+        // The agent's reply — kept whole (newlines embedded) so the TUI can
+        // render markdown with cross-line state (code fences).
         AgentEvent::Message { text } => {
-            let flat = text.replace('\n', " ");
-            Some(format!("◀ {}", flat.trim()))
+            let t = text.trim();
+            if t.is_empty() {
+                Vec::new()
+            } else {
+                vec![TranscriptLine::new(K::Text, t)]
+            }
         }
-        AgentEvent::ToolStarted { name } => Some(format!("→ {name}")),
-        AgentEvent::ApprovalRequested(ctx) => Some(format!(
-            "⏸ approval: {} {}",
-            ctx.tool,
-            ctx.description.as_deref().unwrap_or("")
-        )),
-        AgentEvent::ApprovalResolved { approved } => {
-            Some(if *approved { "✓ approved".into() } else { "✗ denied".into() })
+        AgentEvent::ToolStarted { name, summary } => {
+            let text = if summary.is_empty() {
+                format!("⏺ {name}")
+            } else {
+                format!("⏺ {name}({summary})")
+            };
+            vec![TranscriptLine::new(K::ToolCall, text)]
         }
-        AgentEvent::Finished { ok } => {
-            Some(if *ok { "● done".into() } else { "● failed".into() })
+        AgentEvent::ToolResult { output, is_error } => {
+            let kind = if *is_error { K::ToolError } else { K::ToolResult };
+            let lines: Vec<&str> = output.lines().collect();
+            let mut out = Vec::new();
+            for (i, line) in lines.iter().take(TOOL_RESULT_LINES).enumerate() {
+                // First line gets the `⎿` branch; continuations are indented.
+                let prefix = if i == 0 { "⎿ " } else { "  " };
+                out.push(TranscriptLine::new(kind, format!("{prefix}{line}")));
+            }
+            let extra = lines.len().saturating_sub(TOOL_RESULT_LINES);
+            if extra > 0 {
+                out.push(TranscriptLine::new(kind, format!("  … +{extra} lines")));
+            }
+            if out.is_empty() {
+                out.push(TranscriptLine::new(kind, "⎿ (no output)".to_string()));
+            }
+            out
         }
-        // Thinking / Tokens / Noise are too noisy or invisible for the tail.
-        _ => None,
+        AgentEvent::ApprovalRequested(ctx) => {
+            let desc = ctx.description.as_deref().unwrap_or("");
+            vec![TranscriptLine::new(
+                K::Approval,
+                format!("⏸ approval: {} {}", ctx.tool, desc).trim_end().to_string(),
+            )]
+        }
+        AgentEvent::ApprovalResolved { approved } => vec![TranscriptLine::new(
+            K::Note,
+            if *approved { "✓ approved" } else { "✗ denied" },
+        )],
+        AgentEvent::Finished { ok } => vec![TranscriptLine::new(
+            K::System,
+            if *ok { "● done" } else { "● failed" },
+        )],
+        _ => Vec::new(),
     }
 }

@@ -24,8 +24,12 @@ pub enum AgentEvent {
     Thinking,
     /// Assistant output text, to show in the agent's window (enables dialogue).
     Message { text: String },
-    /// The agent began invoking a tool.
-    ToolStarted { name: String },
+    /// The agent began invoking a tool. `summary` is a one-line preview of the
+    /// tool input (e.g. the Bash command, or an edited file's path).
+    ToolStarted { name: String, summary: String },
+    /// The result of a tool call (its output text and whether it errored) — the
+    /// content shown under the `⎿` branch in the window.
+    ToolResult { output: String, is_error: bool },
     /// The agent is blocked awaiting approval for a tool call. This is the
     /// trigger for the urgent → master layout behavior.
     ApprovalRequested(ApprovalCtx),

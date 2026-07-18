@@ -6,7 +6,7 @@
 
 use awm_core::{plan_layout, Engine, LayoutMode};
 use awm_pty::{CommandSpec, Decision};
-use awm_proto::{AgentId, AgentState, LayoutCmd, Tags};
+use awm_proto::{AgentId, AgentState, LayoutCmd, LineKind, Tags};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -160,7 +160,7 @@ fn multi_turn_dialogue_shows_replies_in_the_window() {
     let tail_has = |e: &Engine, needle: &str| {
         e.registry()
             .record(id)
-            .map(|r| r.tail.iter().any(|l| l.contains(needle)))
+            .map(|r| r.tail.iter().any(|l| l.text.contains(needle)))
             .unwrap_or(false)
     };
 
@@ -177,6 +177,27 @@ fn multi_turn_dialogue_shows_replies_in_the_window() {
     assert!(!engine.registry().record(id).unwrap().state.is_terminal());
 
     engine.send_message(id, "bye").unwrap(); // let it end cleanly
+    engine.join();
+}
+
+#[test]
+fn work_agent_renders_tool_call_result_and_markdown() {
+    let mut engine = Engine::new();
+    let id = engine
+        .spawn(script_spec("mock-work.py"), "w", Tags::empty(), None, false)
+        .unwrap();
+
+    assert!(pump_until(&mut engine, |e| e.registry().all_terminal()));
+
+    let rec = engine.registry().record(id).unwrap();
+    let has = |kind: LineKind, needle: &str| {
+        rec.tail.iter().any(|l| l.kind == kind && l.text.contains(needle))
+    };
+    // Content that used to be dropped now reaches the window, Claude-style.
+    assert!(has(LineKind::ToolCall, "Bash(ls -la)"), "tool call with args");
+    assert!(has(LineKind::ToolResult, "Cargo.toml"), "tool output shown");
+    assert!(has(LineKind::Text, "Summary"), "markdown answer shown");
+
     engine.join();
 }
 

@@ -125,10 +125,16 @@ fn focus_step_wraps() {
 #[test]
 fn tail_ring_is_bounded() {
     let (mut reg, ids) = reg_with(1);
-    // describe() emits a line per ToolStarted; push well past the cap.
-    for i in 0..500 {
-        reg.apply_event(ids[0], &AgentEvent::ToolStarted { name: format!("t{i}") });
+    // One transcript line per ToolStarted; push well past the cap.
+    for i in 0..1000 {
+        reg.apply_event(
+            ids[0],
+            &AgentEvent::ToolStarted {
+                name: format!("t{i}"),
+                summary: String::new(),
+            },
+        );
     }
     let n = reg.record(ids[0]).unwrap().tail.len();
-    assert!(n <= 200, "tail should be capped, was {n}");
+    assert!(n <= 400, "tail should be capped, was {n}");
 }

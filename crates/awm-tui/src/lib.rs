@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-use awm_proto::{AgentId, AgentState, AgentView, LayoutCmd, Renderer, Tags};
+use awm_proto::{AgentId, AgentState, AgentView, LayoutCmd, LineKind, Renderer, Tags, TranscriptLine};
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -206,7 +206,7 @@ fn draw_pane(frame: &mut Frame, view: &AgentView, focused: bool, area: Rect) {
         .border_style(style)
         .title(Span::styled(title, style));
 
-    let body: Vec<Line> = view.tail.iter().map(|l| Line::from(l.as_str())).collect();
+    let body: Vec<Line> = view.tail.iter().flat_map(render_transcript_line).collect();
     frame.render_widget(Paragraph::new(body).block(block), area);
 }
 
@@ -214,6 +214,132 @@ fn draw_pane(frame: &mut Frame, view: &AgentView, focused: bool, area: Rect) {
 fn draw_empty(frame: &mut Frame, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(" no agents ");
     frame.render_widget(Paragraph::new("").block(block), area);
+}
+
+/// Render one transcript line to styled ratatui line(s), Claude Code-style:
+/// green `⏺` tool calls, dim `⎿` results (red on error), and markdown for text.
+fn render_transcript_line(tl: &TranscriptLine) -> Vec<Line<'static>> {
+    let plain = |text: &str, style: Style| vec![Line::from(Span::styled(text.to_string(), style))];
+    match tl.kind {
+        LineKind::Text => markdown_lines(&tl.text),
+        LineKind::ToolCall => plain(&tl.text, Style::default().fg(Color::Green)),
+        LineKind::ToolResult => plain(&tl.text, Style::default().fg(Color::DarkGray)),
+        LineKind::ToolError => plain(&tl.text, Style::default().fg(Color::Red)),
+        LineKind::Thinking => plain(
+            &tl.text,
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        ),
+        LineKind::System => plain(&tl.text, Style::default().fg(Color::DarkGray)),
+        LineKind::Note => plain(&tl.text, Style::default().fg(Color::Cyan)),
+        LineKind::Approval => plain(
+            &tl.text,
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+    }
+}
+
+/// Lightweight markdown → styled lines: fenced code blocks, `#` headers,
+/// `- `/`* ` bullets, and inline `**bold**` / `*italic*` / `` `code` ``.
+fn markdown_lines(text: &str) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mut in_code = false;
+    for raw in text.lines() {
+        let trimmed = raw.trim_end();
+        if trimmed.trim_start().starts_with("```") {
+            in_code = !in_code;
+            out.push(Line::from(Span::styled(
+                trimmed.to_string(),
+                Style::default().fg(Color::DarkGray),
+            )));
+            continue;
+        }
+        if in_code {
+            out.push(Line::from(Span::styled(
+                trimmed.to_string(),
+                Style::default().fg(Color::Cyan),
+            )));
+            continue;
+        }
+        // ATX headers.
+        let ltrim = trimmed.trim_start();
+        if let Some(h) = ltrim.strip_prefix("### ").or_else(|| ltrim.strip_prefix("## ")).or_else(|| ltrim.strip_prefix("# ")) {
+            out.push(Line::from(Span::styled(
+                h.to_string(),
+                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            )));
+            continue;
+        }
+        // List bullets → a real bullet, then inline styling on the rest.
+        if let Some(rest) = ltrim.strip_prefix("- ").or_else(|| ltrim.strip_prefix("* ")) {
+            let mut spans = vec![Span::styled("• ".to_string(), Style::default().fg(Color::Yellow))];
+            spans.extend(inline_spans(rest));
+            out.push(Line::from(spans));
+            continue;
+        }
+        out.push(Line::from(inline_spans(trimmed)));
+    }
+    if out.is_empty() {
+        out.push(Line::from(String::new()));
+    }
+    out
+}
+
+/// Inline markdown within a line: `**bold**`, `*italic*`/`_italic_`, `` `code` ``.
+fn inline_spans(s: &str) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    let flush = |buf: &mut String, spans: &mut Vec<Span<'static>>| {
+        if !buf.is_empty() {
+            spans.push(Span::raw(std::mem::take(buf)));
+        }
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        // `code`
+        if c == '`' {
+            if let Some(end) = (i + 1..chars.len()).find(|&j| chars[j] == '`') {
+                flush(&mut buf, &mut spans);
+                let code: String = chars[i + 1..end].iter().collect();
+                spans.push(Span::styled(code, Style::default().fg(Color::Cyan)));
+                i = end + 1;
+                continue;
+            }
+        }
+        // **bold**
+        if c == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            if let Some(end) = find_double(&chars, i + 2, '*') {
+                flush(&mut buf, &mut spans);
+                let b: String = chars[i + 2..end].iter().collect();
+                spans.push(Span::styled(b, Style::default().add_modifier(Modifier::BOLD)));
+                i = end + 2;
+                continue;
+            }
+        }
+        // *italic* or _italic_
+        if (c == '*' || c == '_') && i + 1 < chars.len() && chars[i + 1] != c {
+            if let Some(end) = (i + 1..chars.len()).find(|&j| chars[j] == c) {
+                flush(&mut buf, &mut spans);
+                let it: String = chars[i + 1..end].iter().collect();
+                spans.push(Span::styled(it, Style::default().add_modifier(Modifier::ITALIC)));
+                i = end + 1;
+                continue;
+            }
+        }
+        buf.push(c);
+        i += 1;
+    }
+    flush(&mut buf, &mut spans);
+    if spans.is_empty() {
+        spans.push(Span::raw(String::new()));
+    }
+    spans
+}
+
+/// Find the start index of the next `cc` double-marker at/after `from`.
+fn find_double(chars: &[char], from: usize, c: char) -> Option<usize> {
+    (from..chars.len().saturating_sub(1)).find(|&j| chars[j] == c && chars[j + 1] == c)
 }
 
 /// The per-agent status bar: `[! ]<id> <name> [tags] <state> <total>tok`.

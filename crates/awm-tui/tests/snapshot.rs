@@ -3,10 +3,15 @@
 //! `Renderer::render` (`unimplemented!`) until Track C lands.
 
 use awm_proto::{
-    AgentId, AgentMeta, AgentState, AgentView, LayoutCmd, Renderer, Tags, TokenUsage,
+    AgentId, AgentMeta, AgentState, AgentView, LayoutCmd, LineKind, Renderer, Tags, TokenUsage,
+    TranscriptLine,
 };
 use awm_tui::AwmTui;
 use ratatui::backend::TestBackend;
+
+fn tl(kind: LineKind, text: &str) -> TranscriptLine {
+    TranscriptLine::new(kind, text)
+}
 
 fn sample_views() -> Vec<AgentView> {
     vec![
@@ -24,7 +29,10 @@ fn sample_views() -> Vec<AgentView> {
                 input: 3400,
                 output: 200,
             },
-            tail: vec!["compiling awm-core".into(), "Finished dev".into()],
+            tail: vec![
+                tl(LineKind::ToolCall, "⏺ Bash(cargo build)"),
+                tl(LineKind::ToolResult, "⎿ Finished dev"),
+            ],
         },
         AgentView {
             meta: AgentMeta {
@@ -41,7 +49,7 @@ fn sample_views() -> Vec<AgentView> {
                 input: 950,
                 output: 70,
             },
-            tail: vec!["awaiting approval: rm -rf build".into()],
+            tail: vec![tl(LineKind::Approval, "⏸ approval: Bash rm -rf build")],
         },
     ]
 }
@@ -69,6 +77,34 @@ fn master_stack_promotes_urgent_agent() {
     tui.render(&views, &LayoutCmd::SetMaster(AgentId(1))).unwrap();
 
     insta::assert_snapshot!("master_stack", buffer_to_string(tui.backend()));
+}
+
+#[test]
+fn claude_style_transcript() {
+    // A window that exercises tool calls, results, and markdown — the Claude-like
+    // rendering (⏺ / ⎿ glyphs, headers, bullets, inline code).
+    let views = vec![AgentView {
+        meta: AgentMeta {
+            id: AgentId(0),
+            name: "worker".into(),
+            tags: Tags::empty(),
+            cwd: "/home/dev/proj".into(),
+            started_at: 0,
+            urgent: false,
+        },
+        state: AgentState::Working,
+        tokens: TokenUsage { input: 1200, output: 90 },
+        tail: vec![
+            tl(LineKind::ToolCall, "⏺ Bash(ls -la)"),
+            tl(LineKind::ToolResult, "⎿ total 8"),
+            tl(LineKind::ToolResult, "  src"),
+            tl(LineKind::Text, "## Summary\n- **two** entries, one `src` dir\n- all good"),
+        ],
+    }];
+
+    let mut tui = AwmTui::new(TestBackend::new(70, 14)).unwrap();
+    tui.render(&views, &LayoutCmd::Monocle(AgentId(0))).unwrap();
+    insta::assert_snapshot!("claude_style", buffer_to_string(tui.backend()));
 }
 
 #[test]

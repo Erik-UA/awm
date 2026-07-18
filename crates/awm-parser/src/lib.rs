@@ -11,10 +11,11 @@
 //! | stream-json line                              | AgentEvent(s)                       |
 //! |-----------------------------------------------|-------------------------------------|
 //! | `type=system, subtype=init`                   | `Started{model, cwd}`               |
-//! | `type=assistant` block `text`/`thinking`      | `Thinking`                          |
-//! | `type=assistant` block `tool_use`             | `ToolStarted{name}`                 |
+//! | `type=assistant` block `text`                 | `Message{text}`                     |
+//! | `type=assistant` block `thinking`             | `Thinking`                          |
+//! | `type=assistant` block `tool_use`             | `ToolStarted{name, summary}`        |
 //! | `type=assistant` `message.usage` present      | `Tokens{input, output}`             |
-//! | `type=user` `tool_result`                     | *(no event)*                        |
+//! | `type=user` `tool_result`                     | `ToolResult{output, is_error}`      |
 //! | `type=control_request, subtype=can_use_tool`  | `ApprovalRequested{..}`             |
 //! | `type=control_response`                       | `ApprovalResolved{approved}`        |
 //! | `type=result`                                 | `Tokens{final}` then `Finished{ok}` |
@@ -73,8 +74,7 @@ impl StreamParser {
         match value.get("type").and_then(Value::as_str) {
             Some("system") => self.parse_system(&value),
             Some("assistant") => self.parse_assistant(&value),
-            // Tool results / other user turns are PTY-buffer output, not events.
-            Some("user") => {}
+            Some("user") => self.parse_user(&value),
             Some("control_request") => self.parse_control_request(&value),
             Some("control_response") => self.parse_control_response(&value),
             Some("result") => self.parse_result(&value),
@@ -129,7 +129,9 @@ impl StreamParser {
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_string();
-                        self.ready.push_back(AgentEvent::ToolStarted { name });
+                        let summary = summarize_tool_input(&name, block.get("input"));
+                        self.ready
+                            .push_back(AgentEvent::ToolStarted { name, summary });
                     }
                     // Other block kinds (e.g. tool_result echoes) carry no event.
                     _ => {}
@@ -141,6 +143,28 @@ impl StreamParser {
         if let Some(usage) = message.and_then(|m| m.get("usage")) {
             self.ready
                 .push_back(AgentEvent::Tokens(token_usage(usage)));
+        }
+    }
+
+    /// A `user` frame carries tool results (the output of the agent's tools).
+    fn parse_user(&mut self, value: &Value) {
+        let Some(blocks) = value
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+                let is_error = block
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let output = tool_result_text(block.get("content"));
+                self.ready
+                    .push_back(AgentEvent::ToolResult { output, is_error });
+            }
         }
     }
 
@@ -233,6 +257,53 @@ fn token_usage(usage: &Value) -> TokenUsage {
     }
 }
 
+/// A one-line preview of a tool's input, like Claude Code's `Tool(summary)`.
+/// Picks the most meaningful field per tool, falling back to compact JSON.
+fn summarize_tool_input(name: &str, input: Option<&Value>) -> String {
+    let Some(input) = input else {
+        return String::new();
+    };
+    let field = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
+    let pick = match name {
+        "Bash" => field("command"),
+        "Read" | "Edit" | "Write" | "NotebookEdit" => field("file_path"),
+        "Grep" | "Glob" => field("pattern"),
+        "Task" => field("description"),
+        "WebFetch" => field("url"),
+        "WebSearch" => field("query"),
+        _ => "",
+    };
+    if !pick.is_empty() {
+        return one_line(pick, 120);
+    }
+    one_line(&input.to_string(), 120)
+}
+
+/// Flatten a tool_result `content` (a string, or an array of `{type,text}`
+/// blocks) into plain text.
+fn tool_result_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Collapse newlines and truncate to `max` chars (char-safe).
+fn one_line(s: &str, max: usize) -> String {
+    let flat = s.replace('\n', " ");
+    if flat.chars().count() > max {
+        let head: String = flat.chars().take(max).collect();
+        format!("{head}…")
+    } else {
+        flat
+    }
+}
+
 /// Trim leading/trailing ASCII whitespace (incl. `\r`) from a byte slice.
 /// Equivalent to the unstable `[u8]::trim_ascii`, inlined for MSRV 1.75.
 fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
@@ -256,6 +327,34 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_tool_summary_and_result() {
+        let mut p = StreamParser::new();
+        p.feed(br#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -la"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","content":"total 4\nfile","is_error":false}]}}
+"#);
+        let events: Vec<_> = std::iter::from_fn(|| p.next_event()).collect();
+        assert!(events.contains(&AgentEvent::ToolStarted {
+            name: "Bash".into(),
+            summary: "ls -la".into(),
+        }));
+        assert!(events.contains(&AgentEvent::ToolResult {
+            output: "total 4\nfile".into(),
+            is_error: false,
+        }));
+    }
+
+    #[test]
+    fn tool_result_array_content_is_flattened() {
+        assert_eq!(
+            tool_result_text(Some(&serde_json::json!([
+                {"type":"text","text":"a"},
+                {"type":"text","text":"b"}
+            ]))),
+            "a\nb"
+        );
+    }
 
     /// Feeding a fixture in one shot and feeding it split at arbitrary byte
     /// offsets must yield the exact same event sequence — proving the parser is

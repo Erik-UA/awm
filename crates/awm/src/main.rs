@@ -30,6 +30,8 @@ enum Spawn {
     Mock,
     /// A multi-turn mock that holds a conversation (for the dialogue demo).
     MockChat,
+    /// A mock that does tool work + markdown (for the Claude-style demo).
+    MockWork,
     Claude(String),
 }
 
@@ -82,6 +84,16 @@ fn spec_for(kind: &Spawn) -> (CommandSpec, Option<String>, bool) {
                 false,
             )
         }
+        Spawn::MockWork => {
+            let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/mock-work.py");
+            (
+                CommandSpec::new("python3", std::env::temp_dir())
+                    .arg(script.to_string_lossy().to_string()),
+                None,
+                false,
+            )
+        }
         Spawn::Claude(prompt) => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
             // `--permission-prompt-tool stdio` routes approval gates to us over the
@@ -119,6 +131,7 @@ fn main() -> std::io::Result<()> {
             }
             "--mock" => roster.push(Spawn::Mock),
             "--chat" => roster.push(Spawn::MockChat),
+            "--work" => roster.push(Spawn::MockWork),
             _ => {}
         }
     }
@@ -167,6 +180,7 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
         let name = match kind {
             Spawn::Mock => format!("mock-{i}"),
             Spawn::MockChat => format!("chat-{i}"),
+            Spawn::MockWork => format!("work-{i}"),
             Spawn::Claude(_) => format!("claude-{i}"),
         };
         engine.spawn(spec, name, Tags::empty(), prompt, handshake)?;
@@ -259,6 +273,7 @@ fn spawn_typed(engine: &mut Engine, kind: &Spawn, text: String) {
     let spawn = match kind {
         Spawn::Claude(_) => Spawn::Claude(text),
         Spawn::MockChat => Spawn::MockChat,
+        Spawn::MockWork => Spawn::MockWork,
         Spawn::Mock => Spawn::Mock,
     };
     let (spec, prompt, handshake) = spec_for(&spawn);

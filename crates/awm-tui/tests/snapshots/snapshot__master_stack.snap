@@ -3,8 +3,8 @@ source: crates/awm-tui/tests/snapshot.rs
 expression: buffer_to_string(tui.backend())
 ---
 ┌! @1 cleaner [#2] BLOCKED 1020tok─────────────────┐┌@0 builder [#1] working 36┐
-│awaiting approval: rm -rf build                   ││compiling awm-core        │
-│                                                  ││Finished dev              │
+│⏸ approval: Bash rm -rf build                     ││⏺ Bash(cargo build)       │
+│                                                  ││⎿ Finished dev            │
 │                                                  ││                          │
 │                                                  ││                          │
 │                                                  ││                          │
