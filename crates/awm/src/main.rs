@@ -36,6 +36,8 @@ enum Spawn {
     MockStream,
     /// A persistent per-turn mock (real-claude-like multi-turn; for the convo demo).
     MockConvo,
+    /// A mock that replies with a markdown table (for the full-markdown demo).
+    MockMd,
     Claude(String),
 }
 
@@ -124,6 +126,17 @@ fn spec_for(kind: &Spawn) -> (CommandSpec, Option<String>, bool, bool) {
                 true,
             )
         }
+        Spawn::MockMd => {
+            let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/mock-md.py");
+            (
+                CommandSpec::new("python3", std::env::temp_dir())
+                    .arg(script.to_string_lossy().to_string()),
+                None,
+                false,
+                false,
+            )
+        }
         Spawn::Claude(prompt) => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
             // `--permission-prompt-tool stdio` routes approval gates to us over the
@@ -167,6 +180,7 @@ fn main() -> std::io::Result<()> {
             "--work" => roster.push(Spawn::MockWork),
             "--stream" => roster.push(Spawn::MockStream),
             "--convo" => roster.push(Spawn::MockConvo),
+            "--md" => roster.push(Spawn::MockMd),
             _ => {}
         }
     }
@@ -218,6 +232,7 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
             Spawn::MockWork => format!("work-{i}"),
             Spawn::MockStream => format!("stream-{i}"),
             Spawn::MockConvo => format!("convo-{i}"),
+            Spawn::MockMd => format!("md-{i}"),
             Spawn::Claude(_) => format!("claude-{i}"),
         };
         engine.spawn(spec, name, Tags::empty(), prompt, handshake, persistent)?;
@@ -314,6 +329,7 @@ fn spawn_typed(engine: &mut Engine, kind: &Spawn, text: String) {
         Spawn::MockWork => Spawn::MockWork,
         Spawn::MockStream => Spawn::MockStream,
         Spawn::MockConvo => Spawn::MockConvo,
+        Spawn::MockMd => Spawn::MockMd,
         Spawn::Mock => Spawn::Mock,
     };
     let (spec, prompt, handshake, persistent) = spec_for(&spawn);

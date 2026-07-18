@@ -206,7 +206,12 @@ fn draw_pane(frame: &mut Frame, view: &AgentView, focused: bool, area: Rect) {
         .border_style(style)
         .title(Span::styled(title, style));
 
-    let body: Vec<Line> = view.tail.iter().flat_map(render_transcript_line).collect();
+    let inner = area.width.saturating_sub(2) as usize; // width inside the border
+    let body: Vec<Line> = view
+        .tail
+        .iter()
+        .flat_map(|tl| render_transcript_line(tl, inner))
+        .collect();
     frame.render_widget(Paragraph::new(body).block(block), area);
 }
 
@@ -218,10 +223,10 @@ fn draw_empty(frame: &mut Frame, area: Rect) {
 
 /// Render one transcript line to styled ratatui line(s), Claude Code-style:
 /// green `⏺` tool calls, dim `⎿` results (red on error), and markdown for text.
-fn render_transcript_line(tl: &TranscriptLine) -> Vec<Line<'static>> {
+fn render_transcript_line(tl: &TranscriptLine, width: usize) -> Vec<Line<'static>> {
     let plain = |text: &str, style: Style| vec![Line::from(Span::styled(text.to_string(), style))];
     match tl.kind {
-        LineKind::Text => markdown_lines(&tl.text),
+        LineKind::Text => markdown_lines(&tl.text, width),
         LineKind::ToolCall => plain(&tl.text, Style::default().fg(Color::Green)),
         LineKind::ToolResult => plain(&tl.text, Style::default().fg(Color::DarkGray)),
         LineKind::ToolError => plain(&tl.text, Style::default().fg(Color::Red)),
@@ -238,19 +243,24 @@ fn render_transcript_line(tl: &TranscriptLine) -> Vec<Line<'static>> {
     }
 }
 
-/// Lightweight markdown → styled lines: fenced code blocks, `#` headers,
-/// `- `/`* ` bullets, and inline `**bold**` / `*italic*` / `` `code` ``.
-fn markdown_lines(text: &str) -> Vec<Line<'static>> {
+/// Markdown → styled lines (block-aware): fenced code, headers, GFM tables,
+/// blockquotes, bullet + ordered lists, horizontal rules, and inline styling.
+fn markdown_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
     let mut in_code = false;
-    for raw in text.lines() {
-        let trimmed = raw.trim_end();
-        if trimmed.trim_start().starts_with("```") {
+    let mut i = 0;
+
+    while i < lines.len() {
+        let trimmed = lines[i].trim_end();
+        let ltrim = trimmed.trim_start();
+
+        // Fenced code blocks.
+        if ltrim.starts_with("```") {
             in_code = !in_code;
-            out.push(Line::from(Span::styled(
-                trimmed.to_string(),
-                Style::default().fg(Color::DarkGray),
-            )));
+            out.push(Line::from(Span::styled(trimmed.to_string(), dim)));
+            i += 1;
             continue;
         }
         if in_code {
@@ -258,28 +268,274 @@ fn markdown_lines(text: &str) -> Vec<Line<'static>> {
                 trimmed.to_string(),
                 Style::default().fg(Color::Cyan),
             )));
+            i += 1;
             continue;
         }
+
+        // GFM table: a `| … |` row followed by a `|---|` separator.
+        if is_table_row(trimmed) && i + 1 < lines.len() && is_table_separator(lines[i + 1]) {
+            let (rendered, consumed) = render_table(&lines[i..], width);
+            out.extend(rendered);
+            i += consumed;
+            continue;
+        }
+
+        // Horizontal rule.
+        if is_hr(ltrim) {
+            out.push(Line::from(Span::styled(
+                "\u{2500}".repeat(width.clamp(3, 100)),
+                dim,
+            )));
+            i += 1;
+            continue;
+        }
+
         // ATX headers.
-        let ltrim = trimmed.trim_start();
-        if let Some(h) = ltrim.strip_prefix("### ").or_else(|| ltrim.strip_prefix("## ")).or_else(|| ltrim.strip_prefix("# ")) {
+        if let Some(h) = ltrim
+            .strip_prefix("### ")
+            .or_else(|| ltrim.strip_prefix("## "))
+            .or_else(|| ltrim.strip_prefix("# "))
+        {
             out.push(Line::from(Span::styled(
                 h.to_string(),
                 Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             )));
+            i += 1;
             continue;
         }
-        // List bullets → a real bullet, then inline styling on the rest.
-        if let Some(rest) = ltrim.strip_prefix("- ").or_else(|| ltrim.strip_prefix("* ")) {
-            let mut spans = vec![Span::styled("• ".to_string(), Style::default().fg(Color::Yellow))];
+
+        // Blockquote.
+        if ltrim == ">" || ltrim.starts_with("> ") {
+            let q = ltrim.strip_prefix("> ").unwrap_or("");
+            let mut spans = vec![Span::styled("\u{258e} ".to_string(), dim)];
+            spans.extend(inline_spans(q));
+            out.push(Line::from(spans));
+            i += 1;
+            continue;
+        }
+
+        // Unordered list.
+        if let Some(rest) = ltrim
+            .strip_prefix("- ")
+            .or_else(|| ltrim.strip_prefix("* "))
+            .or_else(|| ltrim.strip_prefix("+ "))
+        {
+            let mut spans = vec![Span::styled("\u{2022} ".to_string(), Style::default().fg(Color::Yellow))];
             spans.extend(inline_spans(rest));
             out.push(Line::from(spans));
+            i += 1;
             continue;
         }
+
+        // Ordered list: `N. text`.
+        if let Some((num, rest)) = split_ordered(ltrim) {
+            let mut spans = vec![Span::styled(
+                format!("{num}. "),
+                Style::default().fg(Color::Yellow),
+            )];
+            spans.extend(inline_spans(rest));
+            out.push(Line::from(spans));
+            i += 1;
+            continue;
+        }
+
         out.push(Line::from(inline_spans(trimmed)));
+        i += 1;
     }
     if out.is_empty() {
         out.push(Line::from(String::new()));
+    }
+    out
+}
+
+/// Column alignment parsed from a table's separator row.
+#[derive(Clone, Copy)]
+enum Align {
+    Left,
+    Right,
+    Center,
+}
+
+fn is_table_row(s: &str) -> bool {
+    s.contains('|')
+}
+
+fn is_table_separator(s: &str) -> bool {
+    let cells = split_cells(s);
+    !cells.is_empty()
+        && cells.iter().all(|c| {
+            let t = c.trim();
+            !t.is_empty() && t.chars().all(|ch| ch == '-' || ch == ':')
+        })
+}
+
+fn is_hr(s: &str) -> bool {
+    let t: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    t.len() >= 3
+        && (t.chars().all(|c| c == '-') || t.chars().all(|c| c == '*') || t.chars().all(|c| c == '_'))
+}
+
+fn split_ordered(s: &str) -> Option<(String, &str)> {
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let rest = &s[digits.len()..];
+    let rest = rest.strip_prefix(". ")?;
+    Some((digits, rest))
+}
+
+/// Split a table row into trimmed cells, dropping the optional leading/trailing pipe.
+fn split_cells(s: &str) -> Vec<String> {
+    let t = s.trim().trim_start_matches('|').trim_end_matches('|');
+    t.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+/// Truncate (char-safe, with `…`) and pad `s` to exactly `w` columns per `align`.
+fn fit(s: &str, w: usize, align: Align) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let cell: String = if chars.len() > w {
+        if w == 0 {
+            String::new()
+        } else {
+            chars[..w - 1].iter().collect::<String>() + "\u{2026}"
+        }
+    } else {
+        s.to_string()
+    };
+    let pad = w.saturating_sub(cell.chars().count());
+    match align {
+        Align::Left => format!("{cell}{}", " ".repeat(pad)),
+        Align::Right => format!("{}{cell}", " ".repeat(pad)),
+        Align::Center => {
+            let l = pad / 2;
+            format!("{}{cell}{}", " ".repeat(l), " ".repeat(pad - l))
+        }
+    }
+}
+
+/// Render a GFM table starting at `lines[0]`; returns the styled lines and the
+/// number of source lines consumed.
+fn render_table(lines: &[&str], width: usize) -> (Vec<Line<'static>>, usize) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let header = split_cells(lines[0]);
+    let ncols = header.len().max(1);
+
+    let aligns: Vec<Align> = split_cells(lines[1])
+        .iter()
+        .map(|c| {
+            let t = c.trim();
+            let l = t.starts_with(':');
+            let r = t.ends_with(':');
+            match (l, r) {
+                (true, true) => Align::Center,
+                (false, true) => Align::Right,
+                _ => Align::Left,
+            }
+        })
+        .collect();
+    let align_of = |c: usize| aligns.get(c).copied().unwrap_or(Align::Left);
+
+    // Body rows: until a non-table line.
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut consumed = 2;
+    for line in &lines[2..] {
+        if !is_table_row(line.trim_end()) || is_table_separator(line) {
+            break;
+        }
+        rows.push(split_cells(line));
+        consumed += 1;
+    }
+
+    let cell = |row: &[String], c: usize| row.get(c).cloned().unwrap_or_default();
+
+    // Natural column widths from content.
+    let mut cols: Vec<usize> = (0..ncols)
+        .map(|c| {
+            let mut w = header.get(c).map(|s| s.chars().count()).unwrap_or(0);
+            for r in &rows {
+                w = w.max(cell(r, c).chars().count());
+            }
+            w.max(1)
+        })
+        .collect();
+
+    // Shrink to fit: total = 1 + Σ(colw + 3). Trim widest columns until it fits.
+    let overhead = 1 + 3 * ncols;
+    let budget = width.saturating_sub(overhead).max(ncols);
+    while cols.iter().sum::<usize>() > budget {
+        let (idx, _) = cols.iter().enumerate().max_by_key(|(_, w)| **w).unwrap();
+        if cols[idx] <= 1 {
+            break;
+        }
+        cols[idx] -= 1;
+    }
+
+    let rule = |left: &str, mid: &str, right: &str| {
+        let mut s = String::from(left);
+        for (c, w) in cols.iter().enumerate() {
+            s.push_str(&"\u{2500}".repeat(w + 2));
+            s.push_str(if c + 1 == ncols { right } else { mid });
+        }
+        Line::from(Span::styled(s, dim))
+    };
+    let data_row = |row: &[String], bold: bool| {
+        let mut spans = vec![Span::styled("\u{2502}".to_string(), dim)];
+        for c in 0..ncols {
+            spans.push(Span::raw(" "));
+            let text = fit(&strip_inline(&cell(row, c)), cols[c], align_of(c));
+            let style = if bold {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            spans.push(Span::styled(text, style));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled("\u{2502}".to_string(), dim));
+        }
+        Line::from(spans)
+    };
+
+    let mut out = vec![
+        rule("\u{250c}", "\u{252c}", "\u{2510}"),
+        data_row(&header, true),
+        rule("\u{251c}", "\u{253c}", "\u{2524}"),
+    ];
+    for r in &rows {
+        out.push(data_row(r, false));
+    }
+    out.push(rule("\u{2514}", "\u{2534}", "\u{2518}"));
+    (out, consumed)
+}
+
+/// Strip inline markdown markers to plain text (for fixed-width table cells).
+fn strip_inline(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '`' | '*' | '_' => i += 1,
+            '[' => {
+                // [text](url) -> text
+                if let Some(close) = (i + 1..chars.len()).find(|&j| chars[j] == ']') {
+                    out.extend(&chars[i + 1..close]);
+                    i = close + 1;
+                    if i < chars.len() && chars[i] == '(' {
+                        if let Some(p) = (i..chars.len()).find(|&j| chars[j] == ')') {
+                            i = p + 1;
+                        }
+                    }
+                } else {
+                    out.push('[');
+                    i += 1;
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
     }
     out
 }
@@ -297,6 +553,23 @@ fn inline_spans(s: &str) -> Vec<Span<'static>> {
     };
     while i < chars.len() {
         let c = chars[i];
+        // [text](url) -> underlined text (url dropped)
+        if c == '[' {
+            if let Some(close) = (i + 1..chars.len()).find(|&j| chars[j] == ']') {
+                if chars.get(close + 1) == Some(&'(') {
+                    if let Some(paren) = (close + 2..chars.len()).find(|&j| chars[j] == ')') {
+                        flush(&mut buf, &mut spans);
+                        let label: String = chars[i + 1..close].iter().collect();
+                        spans.push(Span::styled(
+                            label,
+                            Style::default().fg(Color::Blue).add_modifier(Modifier::UNDERLINED),
+                        ));
+                        i = paren + 1;
+                        continue;
+                    }
+                }
+            }
+        }
         // `code`
         if c == '`' {
             if let Some(end) = (i + 1..chars.len()).find(|&j| chars[j] == '`') {

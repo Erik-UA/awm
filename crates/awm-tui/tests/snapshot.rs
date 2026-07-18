@@ -108,6 +108,34 @@ fn claude_style_transcript() {
 }
 
 #[test]
+fn markdown_table_renders_bordered() {
+    let table = "Here are the phases:\n\n\
+| Phase | Status | Notes |\n\
+|-------|:------:|-------|\n\
+| 0 | done | scaffold |\n\
+| 1 | done | **frozen** contracts |\n\
+| 4 | wip | hardening |\n\n\
+> tables render bordered now\n\n\
+1. first\n2. second";
+    let views = vec![AgentView {
+        meta: AgentMeta {
+            id: AgentId(0),
+            name: "worker".into(),
+            tags: Tags::empty(),
+            cwd: "/p".into(),
+            started_at: 0,
+            urgent: false,
+        },
+        state: AgentState::Working,
+        tokens: TokenUsage::default(),
+        tail: vec![tl(LineKind::Text, table)],
+    }];
+    let mut tui = AwmTui::new(TestBackend::new(60, 18)).unwrap();
+    tui.render(&views, &LayoutCmd::Monocle(AgentId(0))).unwrap();
+    insta::assert_snapshot!("markdown_table", buffer_to_string(tui.backend()));
+}
+
+#[test]
 fn monocle_full_screens_one_agent() {
     let mut tui = AwmTui::new(TestBackend::new(80, 24)).unwrap();
     let views = sample_views();
