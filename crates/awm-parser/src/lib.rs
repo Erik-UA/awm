@@ -172,21 +172,34 @@ impl StreamParser {
     }
 
     /// A `stream_event` frame wraps a raw Anthropic streaming event
-    /// (`--include-partial-messages`). We surface text deltas as `MessageDelta`;
-    /// other stream events (block start/stop, message deltas) carry no line.
+    /// (`--include-partial-messages`). We surface text deltas as `MessageDelta`
+    /// and thinking (reasoning) deltas as `Thinking`; other stream events (block
+    /// start/stop, message deltas) carry no line.
     fn parse_stream_event(&mut self, value: &Value) {
         let inner = value.get("event");
         let inner_type = inner.and_then(|e| e.get("type")).and_then(Value::as_str);
         if inner_type == Some("content_block_delta") {
             let delta = inner.and_then(|e| e.get("delta"));
-            if delta.and_then(|d| d.get("type")).and_then(Value::as_str) == Some("text_delta") {
-                let text = delta
-                    .and_then(|d| d.get("text"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                self.ready.push_back(AgentEvent::MessageDelta { text });
-                return;
+            match delta.and_then(|d| d.get("type")).and_then(Value::as_str) {
+                Some("text_delta") => {
+                    let text = delta
+                        .and_then(|d| d.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    self.ready.push_back(AgentEvent::MessageDelta { text });
+                    return;
+                }
+                Some("thinking_delta") => {
+                    let text = delta
+                        .and_then(|d| d.get("thinking"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    self.ready.push_back(AgentEvent::Thinking { text });
+                    return;
+                }
+                _ => {}
             }
         }
         self.ready.push_back(AgentEvent::Noise);
@@ -455,6 +468,19 @@ mod tests {
         assert!(events.contains(&AgentEvent::MessageDelta { text: "Hel".into() }));
         // Non-text stream events are inert Noise.
         assert!(events.contains(&AgentEvent::Noise));
+    }
+
+    #[test]
+    fn stream_event_thinking_delta_becomes_thinking() {
+        let mut p = StreamParser::new();
+        p.feed(br#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me"}}}
+"#);
+        let events: Vec<_> = std::iter::from_fn(|| p.next_event()).collect();
+        assert!(events.contains(&AgentEvent::Thinking {
+            text: "Let me".into()
+        }));
+        // A thinking delta is not Noise (it carries the reasoning text).
+        assert!(!events.contains(&AgentEvent::Noise));
     }
 
     #[test]

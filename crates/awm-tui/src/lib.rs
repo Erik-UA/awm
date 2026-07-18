@@ -755,14 +755,22 @@ fn find_double(chars: &[char], from: usize, c: char) -> Option<usize> {
     (from..chars.len().saturating_sub(1)).find(|&j| chars[j] == c && chars[j + 1] == c)
 }
 
-/// The per-agent status bar: `[! ]<id> <name> [tags] <state> <total>tok`.
+/// The per-agent status bar: `[! ]<id> <name> [tags] <state> <total>tok[ · <mode>]`.
 ///
 /// The leading `! ` marker is emitted for urgent agents so the highlight is
-/// visible in plain-text snapshots (which carry symbols, not styles).
+/// visible in plain-text snapshots (which carry symbols, not styles). When the
+/// agent's [`AgentInfo`] is known, its permission mode is appended as ` · <mode>`.
 fn status_bar(view: &AgentView) -> String {
     let marker = if view.is_urgent() { "! " } else { "" };
+    let mode = view
+        .info
+        .as_ref()
+        .map(|i| i.permission_mode.as_str())
+        .filter(|m| !m.is_empty())
+        .map(|m| format!(" \u{b7} {m}"))
+        .unwrap_or_default();
     format!(
-        "{marker}{id} {name} [{tags}] {state} {total}tok",
+        "{marker}{id} {name} [{tags}] {state} {total}tok{mode}",
         id = view.meta.id,
         name = view.meta.name,
         tags = format_tags(view.meta.tags),
@@ -851,6 +859,26 @@ mod tests {
         }
     }
 
+    fn view_with_info(info: Option<AgentInfo>) -> AgentView {
+        AgentView {
+            meta: AgentMeta {
+                id: AgentId(0),
+                name: "builder".into(),
+                tags: Tags::empty(),
+                cwd: "/p".into(),
+                started_at: 0,
+                urgent: false,
+            },
+            state: AgentState::Working,
+            tokens: TokenUsage {
+                input: 100,
+                output: 20,
+            },
+            info,
+            tail: vec![],
+        }
+    }
+
     #[test]
     fn card_renders_populated_info() {
         let mut tui = AwmTui::new(TestBackend::new(60, 30)).unwrap();
@@ -890,5 +918,28 @@ mod tests {
         for line in wrap_joined(&items, ", ", 24) {
             assert!(line.chars().count() <= 24, "line too wide: {line:?}");
         }
+    }
+
+    #[test]
+    fn status_bar_appends_permission_mode_when_known() {
+        let view = view_with_info(Some(AgentInfo {
+            permission_mode: "plan".into(),
+            ..Default::default()
+        }));
+        assert_eq!(status_bar(&view), "@0 builder [-] working 120tok \u{b7} plan");
+    }
+
+    #[test]
+    fn status_bar_omits_mode_when_info_absent() {
+        // With `info: None` the bar is byte-identical to the pre-mode format —
+        // this is what the existing snapshots rely on.
+        let view = view_with_info(None);
+        assert_eq!(status_bar(&view), "@0 builder [-] working 120tok");
+    }
+
+    #[test]
+    fn status_bar_omits_mode_when_empty() {
+        let view = view_with_info(Some(AgentInfo::default()));
+        assert_eq!(status_bar(&view), "@0 builder [-] working 120tok");
     }
 }
