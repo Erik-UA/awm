@@ -19,9 +19,13 @@ use std::path::PathBuf;
 pub enum AgentEvent {
     /// Session initialized (maps from the stream-json `system/init` event).
     Started { model: String, cwd: PathBuf },
-    /// The agent is reasoning (a `thinking` block) — actively working, no
-    /// user-facing text.
-    Thinking,
+    /// Full session metadata from `init` — model, permission mode, and the
+    /// agent's tools / skills / plugins / slash-commands / subagents. Drives the
+    /// inspection card and the status-bar mode indicator.
+    Info(AgentInfo),
+    /// The agent is reasoning (a `thinking` block). `text` is the reasoning to
+    /// show dimmed, when available (may be empty).
+    Thinking { text: String },
     /// Assistant output text, to show in the agent's window (enables dialogue).
     Message { text: String },
     /// A streamed chunk of the in-progress assistant reply (from
@@ -78,6 +82,18 @@ pub struct ApprovalCtx {
     /// A unified diff for edit-style tools, when awm derives one for display.
     /// Not present on the wire — populated by the core, not the control channel.
     pub diff: Option<String>,
+}
+
+/// Session metadata reported at `init`. All lists come straight from the CLI.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub model: String,
+    pub permission_mode: String,
+    pub tools: Vec<String>,
+    pub skills: Vec<String>,
+    pub plugins: Vec<String>,
+    pub slash_commands: Vec<String>,
+    pub agents: Vec<String>,
 }
 
 /// Cumulative token usage for a session.

@@ -29,6 +29,7 @@ fn sample_views() -> Vec<AgentView> {
                 input: 3400,
                 output: 200,
             },
+            info: None,
             tail: vec![
                 tl(LineKind::ToolCall, "⏺ Bash(cargo build)"),
                 tl(LineKind::ToolResult, "⎿ Finished dev"),
@@ -49,6 +50,7 @@ fn sample_views() -> Vec<AgentView> {
                 input: 950,
                 output: 70,
             },
+            info: None,
             tail: vec![tl(LineKind::Approval, "⏸ approval: Bash rm -rf build")],
         },
     ]
@@ -94,6 +96,7 @@ fn claude_style_transcript() {
         },
         state: AgentState::Working,
         tokens: TokenUsage { input: 1200, output: 90 },
+        info: None,
         tail: vec![
             tl(LineKind::ToolCall, "⏺ Bash(ls -la)"),
             tl(LineKind::ToolResult, "⎿ total 8"),
@@ -128,6 +131,7 @@ fn markdown_table_renders_bordered() {
         },
         state: AgentState::Working,
         tokens: TokenUsage::default(),
+        info: None,
         tail: vec![tl(LineKind::Text, table)],
     }];
     let mut tui = AwmTui::new(TestBackend::new(60, 18)).unwrap();

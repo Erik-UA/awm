@@ -87,7 +87,7 @@ fn terminal_states_absorb_everything() {
             model: "m".into(),
             cwd: "/".into(),
         },
-        AgentEvent::Thinking,
+        AgentEvent::Thinking { text: String::new() },
         AgentEvent::ToolStarted { name: "Edit".into(), summary: "f.txt".into() },
         approval(),
         AgentEvent::ApprovalResolved { approved: true },
@@ -105,7 +105,7 @@ fn terminal_states_absorb_everything() {
 #[test]
 fn thinking_and_tool_keep_agent_working() {
     assert_eq!(
-        AgentState::Idle.apply(&AgentEvent::Thinking),
+        AgentState::Idle.apply(&AgentEvent::Thinking { text: String::new() }),
         AgentState::Working
     );
     assert_eq!(
@@ -135,7 +135,7 @@ fn event_and_state_serde_round_trip() {
 
 fn arb_event() -> impl Strategy<Value = AgentEvent> {
     prop_oneof![
-        Just(AgentEvent::Thinking),
+        Just(AgentEvent::Thinking { text: String::new() }),
         Just(AgentEvent::Noise),
         Just(AgentEvent::ToolStarted { name: "T".into(), summary: "s".into() }),
         Just(approval()),

@@ -41,12 +41,18 @@ impl<B: Backend> AwmTui<B> {
     /// Draw a frame with an optional focus highlight and an optional bottom
     /// input bar (the `Ctrl+p` spawn prompt). `render` from the [`Renderer`]
     /// trait is this with both `None`.
+    /// Draw a frame. `scroll` is the focused pane's scrollback offset (0 = follow
+    /// the newest output); `show_card` renders the focused agent's inspection card
+    /// instead of the normal layout. `render` from [`Renderer`] passes the defaults.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
         views: &[AgentView],
         layout: &LayoutCmd,
         focus: Option<AgentId>,
         prompt: Option<&str>,
+        scroll: u16,
+        show_card: bool,
     ) -> std::io::Result<()> {
         self.terminal.draw(|frame| {
             let full = frame.size();
@@ -61,7 +67,14 @@ impl<B: Backend> AwmTui<B> {
                 }
                 None => full,
             };
-            render_into(frame, views, layout, focus, area);
+            // The inspection card takes over the focused agent's view.
+            if show_card {
+                if let Some(v) = focus.and_then(|id| find(views, id)) {
+                    render_card(frame, v, area);
+                    return;
+                }
+            }
+            render_into(frame, views, layout, focus, scroll, area);
         })?;
         Ok(())
     }
@@ -69,24 +82,26 @@ impl<B: Backend> AwmTui<B> {
 
 impl<B: Backend> Renderer for AwmTui<B> {
     fn render(&mut self, views: &[AgentView], layout: &LayoutCmd) -> std::io::Result<()> {
-        self.draw(views, layout, None, None)
+        self.draw(views, layout, None, None, 0, false)
     }
 }
 
 /// Dispatch a layout command into `area`, optionally marking the focused agent.
+/// `scroll` applies to whichever pane is focused.
 fn render_into(
     frame: &mut Frame,
     views: &[AgentView],
     layout: &LayoutCmd,
     focus: Option<AgentId>,
+    scroll: u16,
     area: Rect,
 ) {
     match layout {
         LayoutCmd::Monocle(id) => match find(views, *id) {
-            Some(v) => draw_pane(frame, v, focus == Some(v.meta.id), area),
+            Some(v) => draw_pane(frame, v, focus == Some(v.meta.id), scroll, area),
             None => draw_empty(frame, area),
         },
-        LayoutCmd::Triage(ids) => draw_triage(frame, views, ids, focus, area),
+        LayoutCmd::Triage(ids) => draw_triage(frame, views, ids, focus, scroll, area),
         // Both promote a single agent to the master zone; the rest of the roster
         // falls into the side stack in roster order.
         LayoutCmd::SetMaster(id) | LayoutCmd::Focus(id) => {
@@ -96,14 +111,25 @@ fn render_into(
                 .map(|v| v.meta.id)
                 .filter(|i| *i != master)
                 .collect();
-            draw_master_stack(frame, views, master, &stack, focus, area);
+            draw_master_stack(frame, views, master, &stack, focus, scroll, area);
         }
         // Treat the head of the stack as master, the tail as the stack.
         LayoutCmd::Stack(ids) => match ids.split_first() {
-            Some((first, rest)) => draw_master_stack(frame, views, *first, rest, focus, area),
+            Some((first, rest)) => {
+                draw_master_stack(frame, views, *first, rest, focus, scroll, area)
+            }
             None => draw_empty(frame, area),
         },
     }
+}
+
+/// The agent inspection card (model / mode / tools / skills / …). **Stub —
+/// Track B implements.** For now it shows a placeholder so the surface compiles.
+fn render_card(frame: &mut Frame, view: &AgentView, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} — inspect ", view.meta.name));
+    frame.render_widget(Paragraph::new("(agent card — Track B)").block(block), area);
 }
 
 /// The bottom input bar (the caller supplies the full label + text; a block
@@ -126,6 +152,7 @@ fn draw_master_stack(
     master_id: AgentId,
     stack_ids: &[AgentId],
     focus: Option<AgentId>,
+    scroll: u16,
     area: Rect,
 ) {
     let master = find(views, master_id);
@@ -134,7 +161,7 @@ fn draw_master_stack(
     // No side stack (or a single agent): the master fills the whole area.
     if stack.is_empty() {
         match master {
-            Some(m) => draw_pane(frame, m, focus == Some(m.meta.id), area),
+            Some(m) => draw_pane(frame, m, focus == Some(m.meta.id), scroll, area),
             None => draw_empty(frame, area),
         }
         return;
@@ -146,10 +173,10 @@ fn draw_master_stack(
         .split(area);
 
     match master {
-        Some(m) => draw_pane(frame, m, focus == Some(m.meta.id), cols[0]),
+        Some(m) => draw_pane(frame, m, focus == Some(m.meta.id), scroll, cols[0]),
         None => draw_empty(frame, cols[0]),
     }
-    draw_stack(frame, &stack, focus, cols[1]);
+    draw_stack(frame, &stack, focus, scroll, cols[1]);
 }
 
 /// Show only the given agents, in order, as equal vertical rows (approval
@@ -159,6 +186,7 @@ fn draw_triage(
     views: &[AgentView],
     ids: &[AgentId],
     focus: Option<AgentId>,
+    scroll: u16,
     area: Rect,
 ) {
     let panes: Vec<&AgentView> = ids.iter().filter_map(|i| find(views, *i)).collect();
@@ -166,25 +194,34 @@ fn draw_triage(
         draw_empty(frame, area);
         return;
     }
-    draw_stack(frame, &panes, focus, area);
+    draw_stack(frame, &panes, focus, scroll, area);
 }
 
 /// Split `area` into equal vertical rows, one per view.
-fn draw_stack(frame: &mut Frame, panes: &[&AgentView], focus: Option<AgentId>, area: Rect) {
+fn draw_stack(
+    frame: &mut Frame,
+    panes: &[&AgentView],
+    focus: Option<AgentId>,
+    scroll: u16,
+    area: Rect,
+) {
     let n = panes.len() as u32;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(vec![Constraint::Ratio(1, n); panes.len()])
         .split(area);
     for (view, rect) in panes.iter().zip(rows.iter()) {
-        draw_pane(frame, view, focus == Some(view.meta.id), *rect);
+        draw_pane(frame, view, focus == Some(view.meta.id), scroll, *rect);
     }
 }
 
 /// Draw one agent pane: a bordered block titled with its status bar, body is the
 /// PTY tail. Urgent agents get a red, bold, `!`-marked frame so they stand out
 /// even in a style-blind (symbol-only) snapshot.
-fn draw_pane(frame: &mut Frame, view: &AgentView, focused: bool, area: Rect) {
+fn draw_pane(frame: &mut Frame, view: &AgentView, focused: bool, scroll: u16, area: Rect) {
+    // Scroll offset applies only to the focused pane (Track A implements the
+    // autoscroll / scrollback math using this).
+    let _scroll_off = if focused { scroll } else { 0 };
     let urgent = view.is_urgent();
     // Urgent (red) wins over focus (cyan); a `▸` marker makes focus visible in a
     // style-blind snapshot. With no focused pane the output is unchanged.

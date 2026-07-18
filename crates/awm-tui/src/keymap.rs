@@ -22,6 +22,13 @@ pub enum Action {
     Deny,
     /// `e` on an urgent agent — zoom in to answer manually.
     EditInline,
+    /// `PgUp` / `PgDn` / `Home` / `End` — scroll the focused pane's history.
+    ScrollUp,
+    ScrollDown,
+    ScrollTop,
+    ScrollBottom,
+    /// `Ctrl+i` — toggle the agent inspection card (skills / plugins / tools).
+    Inspect,
 }
 
 /// Translate a key press to an [`Action`], or `None` if unbound.
@@ -46,6 +53,15 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('y') if !ctrl => Some(Action::Approve),
         KeyCode::Char('n') if !ctrl => Some(Action::Deny),
         KeyCode::Char('e') if !ctrl => Some(Action::EditInline),
+
+        // Scrollback of the focused pane.
+        KeyCode::PageUp => Some(Action::ScrollUp),
+        KeyCode::PageDown => Some(Action::ScrollDown),
+        KeyCode::Home => Some(Action::ScrollTop),
+        KeyCode::End => Some(Action::ScrollBottom),
+
+        // Agent inspection card.
+        KeyCode::Char('i') if ctrl => Some(Action::Inspect),
 
         _ => None,
     }

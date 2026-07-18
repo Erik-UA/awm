@@ -123,7 +123,15 @@ impl StreamParser {
                             .to_string();
                         self.ready.push_back(AgentEvent::Message { text });
                     }
-                    Some("thinking") => self.ready.push_back(AgentEvent::Thinking),
+                    Some("thinking") => {
+                        // Track C fills the reasoning text; empty for now.
+                        let text = block
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        self.ready.push_back(AgentEvent::Thinking { text });
+                    }
                     Some("tool_use") => {
                         let name = block
                             .get("name")

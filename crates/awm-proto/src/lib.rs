@@ -20,7 +20,7 @@ pub mod state;
 pub mod traits;
 pub mod view;
 
-pub use event::{AgentEvent, ApprovalCtx, TokenUsage};
+pub use event::{AgentEvent, AgentInfo, ApprovalCtx, TokenUsage};
 pub use layout::LayoutCmd;
 pub use meta::{AgentId, AgentMeta, Tags};
 pub use state::AgentState;

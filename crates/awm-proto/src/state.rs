@@ -49,7 +49,9 @@ impl AgentState {
 
         match event {
             E::Started { .. } => S::Working,
-            E::Thinking
+            // Info is metadata only — no lifecycle change.
+            E::Info(_) => self,
+            E::Thinking { .. }
             | E::Message { .. }
             | E::MessageDelta { .. }
             | E::ToolStarted { .. }

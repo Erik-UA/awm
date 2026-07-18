@@ -64,6 +64,9 @@ impl Input {
     }
 }
 
+/// Lines scrolled per PgUp/PgDn.
+const SCROLL_STEP: u16 = 8;
+
 fn mock_script() -> PathBuf {
     // Repo-relative in dev; falls back to the fixtures dir next to the binary's
     // manifest at build time.
@@ -244,6 +247,8 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
     let mut tui = AwmTui::new(CrosstermBackend::new(stdout()))?;
     let mut mode = LayoutMode::Tiling;
     let mut input: Option<Input> = None;
+    let mut scroll: u16 = 0; // focused pane's scrollback offset (0 = follow bottom)
+    let mut show_card = false; // agent inspection card toggle
 
     loop {
         if event::poll(Duration::from_millis(50))? {
@@ -298,10 +303,22 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
                         }
                         _ => {
                             if let Some(action) = map_key(key) {
-                                if matches!(action, Action::SpawnPrompt) {
-                                    input = Some(Input::Spawn(String::new()));
-                                } else {
-                                    handle_action(action, &mut engine, &mut mode, &spawn_kind);
+                                match action {
+                                    Action::SpawnPrompt => {
+                                        input = Some(Input::Spawn(String::new()))
+                                    }
+                                    // Scrollback of the focused pane (Track A
+                                    // refines clamping to content height).
+                                    Action::ScrollUp => scroll = scroll.saturating_add(SCROLL_STEP),
+                                    Action::ScrollDown => {
+                                        scroll = scroll.saturating_sub(SCROLL_STEP)
+                                    }
+                                    Action::ScrollTop => scroll = u16::MAX,
+                                    Action::ScrollBottom => scroll = 0,
+                                    Action::Inspect => show_card = !show_card,
+                                    other => {
+                                        handle_action(other, &mut engine, &mut mode, &spawn_kind)
+                                    }
                                 }
                             }
                         }
@@ -314,7 +331,14 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
         let layout = plan_layout(engine.registry(), mode);
         let focus = engine.registry().focus();
         let bar = input.as_ref().map(|i| i.bar());
-        tui.draw(&engine.registry().views(), &layout, focus, bar.as_deref())?;
+        tui.draw(
+            &engine.registry().views(),
+            &layout,
+            focus,
+            bar.as_deref(),
+            scroll,
+            show_card,
+        )?;
     }
     engine.shutdown();
     Ok(())
@@ -362,6 +386,8 @@ fn handle_action(action: Action, engine: &mut Engine, mode: &mut LayoutMode, spa
         }
         Action::Approve => answer_target(engine, Decision::Allow),
         Action::Deny => answer_target(engine, Decision::Deny("denied from awm".into())),
+        // Scroll / Inspect are handled in the loop (they touch view-only state).
+        _ => {}
     }
 }
 

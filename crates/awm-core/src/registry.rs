@@ -5,7 +5,7 @@
 //! layout engine can promote the oldest-blocked agent to the master zone.
 
 use awm_proto::{
-    AgentEvent, AgentId, AgentMeta, AgentState, AgentView, ApprovalCtx, LineKind, Tags,
+    AgentEvent, AgentId, AgentInfo, AgentMeta, AgentState, AgentView, ApprovalCtx, LineKind, Tags,
     TokenUsage, TranscriptLine,
 };
 use std::collections::{HashMap, VecDeque};
@@ -27,6 +27,8 @@ pub struct AgentRecord {
     pub blocked_since: Option<u64>,
     /// The pending approval context while blocked (carries the `request_id`).
     pub pending: Option<ApprovalCtx>,
+    /// Session metadata from `init` (model, mode, tools/skills/plugins…).
+    pub info: Option<AgentInfo>,
     /// Whether the last tail line is an in-progress streamed reply.
     streaming: bool,
 }
@@ -37,6 +39,7 @@ impl AgentRecord {
             meta: self.meta.clone(),
             state: self.state,
             tokens: self.tokens,
+            info: self.info.clone(),
             tail: self.tail.iter().cloned().collect(),
         }
     }
@@ -85,6 +88,7 @@ impl Registry {
                 tail: VecDeque::new(),
                 blocked_since: None,
                 pending: None,
+                info: None,
                 streaming: false,
             },
         );
@@ -120,6 +124,7 @@ impl Registry {
                     rec.blocked_since = None;
                     rec.meta.urgent = false;
                 }
+                AgentEvent::Info(i) => rec.info = Some(i.clone()),
                 _ => {}
             }
 
@@ -151,7 +156,7 @@ impl Registry {
                 }
                 // Invisible events must NOT disturb an in-progress stream — the
                 // stream's block-start/stop frames arrive as Noise between deltas.
-                AgentEvent::Noise | AgentEvent::Tokens(_) | AgentEvent::Thinking => {}
+                AgentEvent::Noise | AgentEvent::Tokens(_) | AgentEvent::Info(_) => {}
                 // Any real line commits the live stream, then records itself.
                 other => {
                     rec.streaming = false;
@@ -311,6 +316,15 @@ fn transcript_lines(event: &AgentEvent) -> Vec<TranscriptLine> {
             K::Note,
             if *approved { "✓ approved" } else { "✗ denied" },
         )],
+        // The agent's reasoning, shown dimmed (Track C fills the text).
+        AgentEvent::Thinking { text } => {
+            let t = text.trim();
+            if t.is_empty() {
+                Vec::new()
+            } else {
+                vec![TranscriptLine::new(K::Thinking, format!("✻ {t}"))]
+            }
+        }
         // A turn ended but the session lives on — a divider, ready for the next.
         AgentEvent::TurnEnded { .. } => {
             vec![TranscriptLine::new(K::System, "─".repeat(24))]

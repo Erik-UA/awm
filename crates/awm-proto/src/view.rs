@@ -1,6 +1,6 @@
 //! The render DTO — a snapshot of one agent handed to the TUI.
 
-use crate::event::TokenUsage;
+use crate::event::{AgentInfo, TokenUsage};
 use crate::meta::AgentMeta;
 use crate::state::AgentState;
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,9 @@ pub struct AgentView {
     pub meta: AgentMeta,
     pub state: AgentState,
     pub tokens: TokenUsage,
+    /// Session metadata from `init` (for the inspection card + mode); `None`
+    /// until the agent reports it.
+    pub info: Option<AgentInfo>,
     /// Most-recent transcript lines (the window body), oldest first.
     pub tail: Vec<TranscriptLine>,
 }
