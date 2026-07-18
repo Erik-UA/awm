@@ -358,6 +358,16 @@ impl Answerer {
         )
     }
 
+    /// Switch the agent's permission mode (`default` / `plan` / `acceptEdits` /
+    /// `bypassPermissions`) — the runtime equivalent of Shift+Tab in claude.
+    pub fn set_permission_mode(&self, mode: &str) -> std::io::Result<()> {
+        let line = format!(
+            r#"{{"type":"control_request","request_id":"awm-mode","request":{{"subtype":"set_permission_mode","mode":"{}"}}}}"#,
+            json_escape(mode)
+        );
+        self.write_line(&line)
+    }
+
     /// Write a single newline-terminated line to the agent's stdin and flush.
     fn write_line(&self, line: &str) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt;

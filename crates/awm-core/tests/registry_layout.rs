@@ -91,6 +91,14 @@ fn streamed_deltas_grow_one_line_and_finalize_without_duplication() {
 }
 
 #[test]
+fn set_permission_mode_updates_view_even_without_prior_info() {
+    let (mut reg, ids) = reg_with(1);
+    reg.set_permission_mode(ids[0], "plan");
+    let view = reg.views().into_iter().next().unwrap();
+    assert_eq!(view.info.unwrap().permission_mode, "plan");
+}
+
+#[test]
 fn tokens_are_recorded() {
     let (mut reg, ids) = reg_with(1);
     reg.apply_event(ids[0], &AgentEvent::Tokens(TokenUsage { input: 100, output: 20 }));

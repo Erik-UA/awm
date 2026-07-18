@@ -221,6 +221,21 @@ impl Registry {
         }
     }
 
+    /// Optimistically record a permission-mode switch for the status bar.
+    pub fn set_permission_mode(&mut self, id: AgentId, mode: &str) {
+        if let Some(rec) = self.agents.get_mut(&id) {
+            match &mut rec.info {
+                Some(info) => info.permission_mode = mode.to_string(),
+                none => {
+                    *none = Some(AgentInfo {
+                        permission_mode: mode.to_string(),
+                        ..Default::default()
+                    })
+                }
+            }
+        }
+    }
+
     pub fn pending_request_id(&self, id: AgentId) -> Option<String> {
         self.agents
             .get(&id)?

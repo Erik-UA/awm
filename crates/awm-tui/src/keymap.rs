@@ -29,6 +29,9 @@ pub enum Action {
     ScrollBottom,
     /// `Ctrl+i` — toggle the agent inspection card (skills / plugins / tools).
     Inspect,
+    /// `Shift+Tab` — cycle the focused agent's permission mode (default → plan →
+    /// acceptEdits), like claude's own mode cycling.
+    CycleMode,
 }
 
 /// Translate a key press to an [`Action`], or `None` if unbound.
@@ -63,6 +66,9 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         // Agent inspection card. Bound to Tab (Ctrl+i and Tab are the same byte
         // 0x09 in a terminal, which crossterm reports as KeyCode::Tab).
         KeyCode::Tab => Some(Action::Inspect),
+
+        // Shift+Tab cycles the focused agent's permission mode.
+        KeyCode::BackTab => Some(Action::CycleMode),
 
         _ => None,
     }
@@ -114,6 +120,12 @@ mod tests {
         assert_eq!(map_key(bare(KeyCode::Char('y'))), Some(Action::Approve));
         assert_eq!(map_key(bare(KeyCode::Char('n'))), Some(Action::Deny));
         assert_eq!(map_key(bare(KeyCode::Char('e'))), Some(Action::EditInline));
+    }
+
+    #[test]
+    fn tab_inspects_and_shift_tab_cycles_mode() {
+        assert_eq!(map_key(bare(KeyCode::Tab)), Some(Action::Inspect));
+        assert_eq!(map_key(bare(KeyCode::BackTab)), Some(Action::CycleMode));
     }
 
     #[test]

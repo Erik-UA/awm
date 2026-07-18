@@ -183,6 +183,18 @@ impl Engine {
         Ok(())
     }
 
+    /// Switch a live agent's permission mode (e.g. into `plan`). Sends the
+    /// control_request and optimistically updates the shown mode.
+    pub fn set_permission_mode(&mut self, id: AgentId, mode: &str) -> std::io::Result<()> {
+        if let Some(answerer) = self.answerers.get(&id) {
+            // Best-effort: a finished agent's stdin is closed, but the optimistic
+            // UI update below should still reflect the requested mode.
+            let _ = answerer.set_permission_mode(mode);
+        }
+        self.reg.set_permission_mode(id, mode);
+        Ok(())
+    }
+
     /// Terminate an agent's process. Its reader thread then sees EOF and the
     /// agent transitions to Failed (via the EOF safety net). No-op if unknown.
     pub fn kill(&mut self, id: AgentId) {

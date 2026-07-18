@@ -67,6 +67,15 @@ impl Input {
 /// Lines scrolled per PgUp/PgDn.
 const SCROLL_STEP: u16 = 8;
 
+/// The next permission mode in the Shift+Tab cycle (bypassPermissions excluded).
+fn next_mode(current: &str) -> &'static str {
+    match current {
+        "default" => "plan",
+        "plan" => "acceptEdits",
+        _ => "default",
+    }
+}
+
 fn mock_script() -> PathBuf {
     // Repo-relative in dev; falls back to the fixtures dir next to the binary's
     // manifest at build time.
@@ -319,6 +328,19 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
                                     Action::ScrollTop => scroll = u16::MAX,
                                     Action::ScrollBottom => scroll = 0,
                                     Action::Inspect => show_card = !show_card,
+                                    // Shift+Tab: cycle the focused agent's mode.
+                                    Action::CycleMode => {
+                                        if let Some(f) = engine.registry().focus() {
+                                            let cur = engine
+                                                .registry()
+                                                .record(f)
+                                                .and_then(|r| r.info.as_ref())
+                                                .map(|i| i.permission_mode.as_str())
+                                                .unwrap_or("default");
+                                            let next = next_mode(cur);
+                                            let _ = engine.set_permission_mode(f, next);
+                                        }
+                                    }
                                     other => {
                                         // Any non-scroll action snaps the pane back
                                         // to the newest output.
