@@ -239,13 +239,14 @@ impl Engine {
 
         self.reg.apply_event(target, &ce.event);
 
-        // When the root process's own turn ends, retire its sub-agent panes.
-        // (Root output has no `parent_tool_use_id`.)
+        // Retire sub-agent panes only when the root PROCESS exits (EOF `Finished`),
+        // not on a per-turn `TurnEnded`. A turn end is not a session end: a
+        // sub-agent — especially a background/async one launched via the `Agent`
+        // tool — outlives the parent's turn (the tool returns immediately and the
+        // parent goes idle), so retiring on `TurnEnded` would collapse its pane
+        // before it does any work. (Root output has no `parent_tool_use_id`.)
         if ce.parent_tool_use_id.is_none()
-            && matches!(
-                ce.event,
-                AgentEvent::TurnEnded { .. } | AgentEvent::Finished { .. }
-            )
+            && matches!(ce.event, AgentEvent::Finished { .. })
         {
             if let Some(children) = self.descendants.remove(&ce.id) {
                 let removed: HashSet<AgentId> = children.iter().copied().collect();
@@ -492,6 +493,40 @@ mod tests {
         engine.route(ev(root, tool(), None, spawn()));
         engine.route(ev(root, tool(), None, spawn()));
         assert_eq!(engine.registry().order().len(), 2, "only one child pane");
+    }
+
+    /// A sub-agent pane must survive the parent's per-turn `TurnEnded` (background
+    /// agents outlive the turn) and be retired only when the root process exits.
+    #[test]
+    fn subagent_pane_survives_turn_end_retires_on_process_exit() {
+        let mut engine = Engine::new();
+        let root = engine.registry_mut().alloc_id();
+        engine
+            .registry_mut()
+            .add(AgentMeta::new(root, "root", PathBuf::from("/tmp"), 0));
+
+        engine.route(ev(
+            root,
+            AgentEvent::ToolStarted { name: "Agent".into(), summary: "bg".into() },
+            None,
+            Some(Spawn { tool_use_id: "toolu_1".into(), description: "bg".into() }),
+        ));
+        let child = *engine.child_by_tool.get("toolu_1").unwrap();
+        assert!(engine.registry().order().contains(&child), "child minted");
+
+        // Parent's turn ends (it launched a background agent and went idle) — the
+        // sub-agent pane must NOT be retired.
+        engine.route(ev(root, AgentEvent::TurnEnded { ok: true }, None, None));
+        assert!(
+            engine.registry().order().contains(&child),
+            "child survives TurnEnded"
+        );
+
+        // The root process exits — now the pane is retired and maps cleaned.
+        engine.route(ev(root, AgentEvent::Finished { ok: true }, None, None));
+        assert!(!engine.registry().order().contains(&child), "child retired on exit");
+        assert!(engine.child_by_tool.is_empty());
+        assert!(engine.parent_of.is_empty());
     }
 
     /// Two sub-agents each blocking on a gate: each approval must land in its OWN

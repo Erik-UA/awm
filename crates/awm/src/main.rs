@@ -160,7 +160,10 @@ fn spec_for(kind: &Spawn) -> (CommandSpec, Option<String>, bool, bool) {
                     .arg(script.to_string_lossy().to_string()),
                 None,
                 false,
-                false,
+                // Persistent: the mock emits a `result` (turn end → TurnEnded) after
+                // launching its sub-agents, so this exercises that sub-agent panes
+                // survive a per-turn end (they retire only on process exit).
+                true,
             )
         }
         Spawn::Claude(prompt) => {

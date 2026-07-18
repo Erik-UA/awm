@@ -69,7 +69,13 @@ time.sleep(0.6)
 nested_tool("toolu_2", "toolu_b2", "cargo test -p awm-core")
 gate("req-2", "toolu_b2", "cargo test -p awm-core")
 
-# Both child panes now block on their own gate. Keep the turn open (no `result`)
-# so they stay on screen to be approved one at a time.
+# The parent ends its turn while the sub-agents keep working in the background
+# (a `result` on a persistent session → TurnEnded, not session end). The child
+# panes must survive this — they retire only when the process actually exits.
+emit({"type": "result", "subtype": "success", "is_error": False,
+      "result": "subagents launched", "usage": {"input_tokens": 200, "output_tokens": 20}})
+
+# Stay alive so the child panes (with their pending gates) remain on screen to be
+# approved one at a time.
 while True:
     time.sleep(3600)
