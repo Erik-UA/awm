@@ -68,6 +68,8 @@ cargo run -p awm            # spawns three mock agents
 | `Ctrl+Enter` | back to tiling (focus in master) |
 | `Ctrl+m` | toggle monocle (full-screen focus) |
 | `Ctrl+t` | toggle triage (only blocked agents, oldest first) |
+| `PgUp` / `PgDn` / `Home` / `End` | scroll the focused pane's history (panes auto-follow newest) |
+| `Tab` | toggle the agent inspection card (model / mode / skills / plugins / tools) |
 | `Ctrl+1..9` | toggle a tag on the focused agent |
 | `Ctrl+p` | spawn an agent — type a prompt, `Enter` to launch, `Esc` to cancel |
 | `Ctrl+x` | kill the focused agent |
