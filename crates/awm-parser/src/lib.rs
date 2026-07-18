@@ -27,18 +27,64 @@ use awm_proto::{AgentEvent, AgentInfo, ApprovalCtx, EventSource, TokenUsage};
 use serde_json::Value;
 use std::collections::VecDeque;
 
+/// A parsed [`AgentEvent`] plus sub-agent correlation that can't ride on the
+/// frozen `AgentEvent` types. `parent_tool_use_id` is the `Task` `tool_use.id`
+/// whose sub-agent produced this event (`None` for the root agent's own
+/// output). `spawn` is set only on the `ToolStarted` event of a `Task` call and
+/// carries the freshly-spawned sub-agent's tool id + description. Consumers that
+/// don't care about sub-agents keep using [`EventSource::next_event`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Routed {
+    pub event: AgentEvent,
+    pub parent_tool_use_id: Option<String>,
+    pub spawn: Option<Spawn>,
+}
+
+/// A `Task` tool call that spawns a sub-agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Spawn {
+    /// The `tool_use.id` of the `Task` call; later nested messages reference it
+    /// via `parent_tool_use_id`.
+    pub tool_use_id: String,
+    /// The sub-agent's task description (from the `Task` input), for its label.
+    pub description: String,
+}
+
 /// Incremental parser turning raw stream-json bytes into [`AgentEvent`]s.
 #[derive(Default)]
 pub struct StreamParser {
     /// Bytes of an as-yet-incomplete trailing line.
     partial: Vec<u8>,
-    /// Parsed-but-not-yet-consumed events.
-    ready: VecDeque<AgentEvent>,
+    /// Parsed-but-not-yet-consumed events, each tagged with sub-agent routing.
+    ready: VecDeque<Routed>,
+    /// `parent_tool_use_id` of the line currently being parsed, stamped onto
+    /// every event it emits. Reset per line.
+    cur_parent: Option<String>,
 }
 
 impl StreamParser {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Enqueue an event, tagged with the current line's `parent_tool_use_id`.
+    fn emit(&mut self, event: AgentEvent) {
+        let parent_tool_use_id = self.cur_parent.clone();
+        self.ready.push_back(Routed {
+            event,
+            parent_tool_use_id,
+            spawn: None,
+        });
+    }
+
+    /// Enqueue an event that also spawns a sub-agent (a `Task` tool call).
+    fn emit_spawn(&mut self, event: AgentEvent, spawn: Spawn) {
+        let parent_tool_use_id = self.cur_parent.clone();
+        self.ready.push_back(Routed {
+            event,
+            parent_tool_use_id,
+            spawn: Some(spawn),
+        });
     }
 
     /// Feed a chunk of raw output. Complete (newline-terminated) lines are
@@ -57,6 +103,9 @@ impl StreamParser {
     /// Parse a single complete line (newline already stripped) and enqueue the
     /// resulting event(s). Blank/whitespace-only lines are ignored.
     fn parse_line(&mut self, line: &[u8]) {
+        // Each line stands alone; clear any previous line's routing context.
+        self.cur_parent = None;
+
         // Tolerate CRLF and surrounding whitespace.
         let line = trim_ascii(line);
         if line.is_empty() {
@@ -66,10 +115,20 @@ impl StreamParser {
         let value: Value = match serde_json::from_slice(line) {
             Ok(v) => v,
             Err(_) => {
-                self.ready.push_back(AgentEvent::Noise);
+                self.emit(AgentEvent::Noise);
                 return;
             }
         };
+
+        // Sub-agent output carries `parent_tool_use_id` (inside `message` for
+        // assistant frames; on the envelope for raw stream events). Stamp it on
+        // every event this line produces so the core can route to a child pane.
+        self.cur_parent = value
+            .get("message")
+            .and_then(|m| m.get("parent_tool_use_id"))
+            .or_else(|| value.get("parent_tool_use_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         match value.get("type").and_then(Value::as_str) {
             Some("system") => self.parse_system(&value),
@@ -80,7 +139,7 @@ impl StreamParser {
             Some("control_response") => self.parse_control_response(&value),
             Some("result") => self.parse_result(&value),
             // Unknown / future / missing `type` → Noise.
-            _ => self.ready.push_back(AgentEvent::Noise),
+            _ => self.emit(AgentEvent::Noise),
         }
     }
 
@@ -99,7 +158,7 @@ impl StreamParser {
             // Full session metadata for the inspection card. `Info` maps to no
             // state transition, so emitting it alongside `Started` leaves the
             // collapsed state sequence unchanged.
-            self.ready.push_back(AgentEvent::Info(AgentInfo {
+            self.emit(AgentEvent::Info(AgentInfo {
                 model: model.clone(),
                 permission_mode: value
                     .get("permissionMode")
@@ -112,10 +171,10 @@ impl StreamParser {
                 slash_commands: string_array(value, "slash_commands"),
                 agents: string_array(value, "agents"),
             }));
-            self.ready.push_back(AgentEvent::Started { model, cwd });
+            self.emit(AgentEvent::Started { model, cwd });
         } else {
             // Unknown system subtype: treat as noise rather than guess.
-            self.ready.push_back(AgentEvent::Noise);
+            self.emit(AgentEvent::Noise);
         }
     }
 
@@ -137,7 +196,7 @@ impl StreamParser {
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_string();
-                        self.ready.push_back(AgentEvent::Message { text });
+                        self.emit(AgentEvent::Message { text });
                     }
                     Some("thinking") => {
                         // Track C fills the reasoning text; empty for now.
@@ -146,7 +205,7 @@ impl StreamParser {
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_string();
-                        self.ready.push_back(AgentEvent::Thinking { text });
+                        self.emit(AgentEvent::Thinking { text });
                     }
                     Some("tool_use") => {
                         let name = block
@@ -155,8 +214,27 @@ impl StreamParser {
                             .unwrap_or_default()
                             .to_string();
                         let summary = summarize_tool_input(&name, block.get("input"));
-                        self.ready
-                            .push_back(AgentEvent::ToolStarted { name, summary });
+                        // A `Task` tool_use spawns a sub-agent: carry its id +
+                        // description out-of-band so the core can mint a child pane.
+                        let spawn = (name == "Task")
+                            .then(|| block.get("id").and_then(Value::as_str))
+                            .flatten()
+                            .map(|tid| Spawn {
+                                tool_use_id: tid.to_string(),
+                                description: block
+                                    .get("input")
+                                    .and_then(|i| i.get("description"))
+                                    .and_then(Value::as_str)
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or("subagent")
+                                    .to_string(),
+                            });
+                        match spawn {
+                            Some(s) => {
+                                self.emit_spawn(AgentEvent::ToolStarted { name, summary }, s)
+                            }
+                            None => self.emit(AgentEvent::ToolStarted { name, summary }),
+                        }
                     }
                     // Other block kinds (e.g. tool_result echoes) carry no event.
                     _ => {}
@@ -166,8 +244,7 @@ impl StreamParser {
 
         // Token accounting, if the assistant frame reports usage.
         if let Some(usage) = message.and_then(|m| m.get("usage")) {
-            self.ready
-                .push_back(AgentEvent::Tokens(token_usage(usage)));
+            self.emit(AgentEvent::Tokens(token_usage(usage)));
         }
     }
 
@@ -187,7 +264,7 @@ impl StreamParser {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
-                    self.ready.push_back(AgentEvent::MessageDelta { text });
+                    self.emit(AgentEvent::MessageDelta { text });
                     return;
                 }
                 Some("thinking_delta") => {
@@ -196,13 +273,13 @@ impl StreamParser {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
-                    self.ready.push_back(AgentEvent::Thinking { text });
+                    self.emit(AgentEvent::Thinking { text });
                     return;
                 }
                 _ => {}
             }
         }
-        self.ready.push_back(AgentEvent::Noise);
+        self.emit(AgentEvent::Noise);
     }
 
     /// A `user` frame carries tool results (the output of the agent's tools).
@@ -221,8 +298,7 @@ impl StreamParser {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 let output = tool_result_text(block.get("content"));
-                self.ready
-                    .push_back(AgentEvent::ToolResult { output, is_error });
+                self.emit(AgentEvent::ToolResult { output, is_error });
             }
         }
     }
@@ -235,7 +311,7 @@ impl StreamParser {
             == Some("can_use_tool");
 
         if !is_can_use_tool {
-            self.ready.push_back(AgentEvent::Noise);
+            self.emit(AgentEvent::Noise);
             return;
         }
         let request = request.unwrap();
@@ -267,7 +343,7 @@ impl StreamParser {
                 .map(str::to_string),
             diff: None,
         };
-        self.ready.push_back(AgentEvent::ApprovalRequested(ctx));
+        self.emit(AgentEvent::ApprovalRequested(ctx));
     }
 
     fn parse_control_response(&mut self, value: &Value) {
@@ -280,29 +356,36 @@ impl StreamParser {
             .and_then(|r| r.get("behavior"))
             .and_then(Value::as_str)
         {
-            Some(behavior) => self.ready.push_back(AgentEvent::ApprovalResolved {
+            Some(behavior) => self.emit(AgentEvent::ApprovalResolved {
                 approved: behavior == "allow",
             }),
-            None => self.ready.push_back(AgentEvent::Noise),
+            None => self.emit(AgentEvent::Noise),
         }
     }
 
     fn parse_result(&mut self, value: &Value) {
         if let Some(usage) = value.get("usage") {
-            self.ready
-                .push_back(AgentEvent::Tokens(token_usage(usage)));
+            self.emit(AgentEvent::Tokens(token_usage(usage)));
         }
         let ok = !value
             .get("is_error")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        self.ready.push_back(AgentEvent::Finished { ok });
+        self.emit(AgentEvent::Finished { ok });
+    }
+}
+
+impl StreamParser {
+    /// Like [`EventSource::next_event`], but also yields sub-agent routing info
+    /// ([`Routed`]) that can't travel on the frozen `AgentEvent` types.
+    pub fn next_routed(&mut self) -> Option<Routed> {
+        self.ready.pop_front()
     }
 }
 
 impl EventSource for StreamParser {
     fn next_event(&mut self) -> Option<AgentEvent> {
-        self.ready.pop_front()
+        self.ready.pop_front().map(|r| r.event)
     }
 }
 
@@ -545,6 +628,46 @@ mod tests {
             out.push(ev);
         }
         out
+    }
+
+    #[test]
+    fn task_spawn_and_nested_message_carry_routing() {
+        let bytes: &[u8] = include_bytes!("../../../fixtures/subagents.jsonl");
+        let mut p = StreamParser::new();
+        p.feed(bytes);
+        let routed: Vec<Routed> = std::iter::from_fn(|| p.next_routed()).collect();
+
+        // The Task tool_use spawns a sub-agent, carrying its id + description.
+        let spawn = routed
+            .iter()
+            .find_map(|r| r.spawn.clone())
+            .expect("Task should carry a Spawn");
+        assert_eq!(spawn.tool_use_id, "toolu_1");
+        assert_eq!(spawn.description, "find handlers");
+        // The Task call itself is the root's own output (no parent).
+        let task = routed
+            .iter()
+            .find(|r| r.spawn.is_some())
+            .unwrap();
+        assert_eq!(task.parent_tool_use_id, None);
+
+        // The nested sub-agent message is attributed to the Task's tool id.
+        let nested = routed
+            .iter()
+            .find(|r| r.event == AgentEvent::Message {
+                text: "Searching for handler definitions...".into(),
+            })
+            .expect("nested sub-agent message present");
+        assert_eq!(nested.parent_tool_use_id.as_deref(), Some("toolu_1"));
+
+        // The root's own follow-up message has no parent.
+        let root_msg = routed
+            .iter()
+            .find(|r| r.event == AgentEvent::Message {
+                text: "The subagent found 4 handlers in src/http/.".into(),
+            })
+            .expect("root follow-up message present");
+        assert_eq!(root_msg.parent_tool_use_id, None);
     }
 
     #[test]

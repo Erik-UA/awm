@@ -320,6 +320,9 @@ fn draw_pane(frame: &mut Frame, view: &AgentView, focused: bool, scroll: u16, ar
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
     } else if focused {
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else if is_subagent(view) {
+        // A spawned sub-agent's pane: dim cyan, subordinate to urgent/focus.
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
     } else {
         Style::default().fg(Color::Gray)
     };
@@ -353,6 +356,13 @@ fn draw_pane(frame: &mut Frame, view: &AgentView, focused: bool, scroll: u16, ar
         .saturating_sub(scroll_off)
         .min(u16::MAX as usize) as u16;
     frame.render_widget(Paragraph::new(body).block(block).scroll((y, 0)), area);
+}
+
+/// Whether this pane is a spawned sub-agent. The frozen `AgentView` carries no
+/// parent field, so the core marks sub-agents with a `↳ ` name prefix (see
+/// awm-core `SUBAGENT_PREFIX`) and the TUI detects it here.
+fn is_subagent(view: &AgentView) -> bool {
+    view.meta.name.starts_with('\u{21b3}')
 }
 
 /// A placeholder pane when there is nothing to show.

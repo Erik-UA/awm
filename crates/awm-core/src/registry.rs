@@ -76,25 +76,53 @@ impl Registry {
         id
     }
 
+    /// A fresh Idle record for `meta`.
+    fn fresh(meta: AgentMeta) -> AgentRecord {
+        AgentRecord {
+            meta,
+            state: AgentState::Idle,
+            tokens: TokenUsage::default(),
+            tail: VecDeque::new(),
+            blocked_since: None,
+            pending: None,
+            info: None,
+            streaming: false,
+        }
+    }
+
     /// Register a new (Idle) agent. Focuses it if nothing is focused yet.
     pub fn add(&mut self, meta: AgentMeta) {
         let id = meta.id;
-        self.agents.insert(
-            id,
-            AgentRecord {
-                meta,
-                state: AgentState::Idle,
-                tokens: TokenUsage::default(),
-                tail: VecDeque::new(),
-                blocked_since: None,
-                pending: None,
-                info: None,
-                streaming: false,
-            },
-        );
+        self.agents.insert(id, Self::fresh(meta));
         self.order.push(id);
         if self.focus.is_none() {
             self.focus = Some(id);
+        }
+    }
+
+    /// Register a new (Idle) agent immediately after `anchor` in roster order, so
+    /// a spawned sub-agent lands adjacent to its parent in the stack. Appends if
+    /// `anchor` is unknown. Never steals focus (like [`Registry::add`]).
+    pub fn add_after(&mut self, anchor: AgentId, meta: AgentMeta) {
+        let id = meta.id;
+        self.agents.insert(id, Self::fresh(meta));
+        match self.order.iter().position(|i| *i == anchor) {
+            Some(pos) => self.order.insert(pos + 1, id),
+            None => self.order.push(id),
+        }
+        if self.focus.is_none() {
+            self.focus = Some(id);
+        }
+    }
+
+    /// Remove an agent entirely — used to retire a finished sub-agent's pane once
+    /// its parent's turn ends. Moves focus to the first remaining agent if it was
+    /// focused. No-op if unknown.
+    pub fn remove(&mut self, id: AgentId) {
+        self.agents.remove(&id);
+        self.order.retain(|i| *i != id);
+        if self.focus == Some(id) {
+            self.focus = self.order.first().copied();
         }
     }
 
