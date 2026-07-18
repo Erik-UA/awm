@@ -41,7 +41,11 @@ pub enum AgentEvent {
     ApprovalResolved { approved: bool },
     /// Token accounting update.
     Tokens(TokenUsage),
-    /// The session ended. `ok` distinguishes success from failure.
+    /// A single turn completed (a `result`) but the session stays alive for the
+    /// next turn — a persistent (multi-turn) agent is now ready for input.
+    TurnEnded { ok: bool },
+    /// The session ended (the process exited). `ok` distinguishes success from
+    /// failure. Terminal.
     Finished { ok: bool },
     /// An unrecognized or malformed input line. Carries no state transition —
     /// the parser emits this instead of panicking on garbage.

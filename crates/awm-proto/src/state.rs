@@ -58,6 +58,8 @@ impl AgentState {
             // Whether approved or denied, the agent resumes working (it either
             // proceeds or handles the denial before finishing).
             E::ApprovalResolved { .. } => S::Working,
+            // A turn finished but the session lives on — back to Idle (ready).
+            E::TurnEnded { .. } => S::Idle,
             E::Finished { ok: true } => S::Done,
             E::Finished { ok: false } => S::Failed,
             // Pure accounting / unrecognized input: no transition.

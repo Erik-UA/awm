@@ -46,6 +46,14 @@ fn denied_approval_resumes_working() {
 }
 
 #[test]
+fn turn_ended_returns_to_idle_not_terminal() {
+    // A persistent agent's per-turn completion is not the end of the session.
+    let s = AgentState::Working.apply(&AgentEvent::TurnEnded { ok: true });
+    assert_eq!(s, AgentState::Idle);
+    assert!(!s.is_terminal());
+}
+
+#[test]
 fn failure_is_terminal() {
     let s = AgentState::Working.apply(&AgentEvent::Finished { ok: false });
     assert_eq!(s, AgentState::Failed);

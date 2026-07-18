@@ -71,6 +71,7 @@ impl Engine {
         tags: Tags,
         prompt: Option<String>,
         handshake: bool,
+        persistent: bool,
     ) -> std::io::Result<AgentId> {
         let id = self.reg.alloc_id();
         let mut meta = AgentMeta::new(id, name, spec.cwd.clone(), 0);
@@ -98,6 +99,14 @@ impl Engine {
                     Ok(chunk) => {
                         parser.feed(&chunk);
                         while let Some(event) = parser.next_event() {
+                            // For a persistent agent a per-turn `result` is not
+                            // the end — it just means "ready for the next turn".
+                            let event = match event {
+                                AgentEvent::Finished { ok } if persistent => {
+                                    AgentEvent::TurnEnded { ok }
+                                }
+                                other => other,
+                            };
                             if tx.send(CoreEvent { id, event }).is_err() {
                                 return; // engine dropped
                             }
@@ -106,14 +115,14 @@ impl Engine {
                     Err(_) => break,
                 }
             }
-            // Process-death safety net: if the stream ended without a `result`
-            // (the child crashed or was killed), this marks the agent Failed.
-            // If it already finished cleanly, the terminal state absorbs it.
+            // Process exit is the real session terminal. The exit code tells a
+            // clean finish (Done) from a crash/kill (Failed); if the agent is
+            // already terminal, this is absorbed.
+            let code = runner.wait().unwrap_or(-1);
             let _ = tx.send(CoreEvent {
                 id,
-                event: AgentEvent::Finished { ok: false },
+                event: AgentEvent::Finished { ok: code == 0 },
             });
-            let _ = runner.wait();
         });
         self.readers.push(handle);
         Ok(id)
@@ -161,6 +170,12 @@ impl Engine {
     /// user message on its stdin and echoes it into the agent's window. The
     /// agent's reply arrives as `Message` events on its stream.
     pub fn send_message(&mut self, id: AgentId, text: &str) -> std::io::Result<()> {
+        // A finished (process-exited) agent can't receive input.
+        if self.reg.record(id).map(|r| r.state.is_terminal()).unwrap_or(true) {
+            self.reg
+                .push_note(id, "\u{25b7} (agent finished — can't message)".to_string());
+            return Ok(());
+        }
         if let Some(answerer) = self.answerers.get(&id) {
             answerer.send_prompt(text)?;
             self.reg.push_note(id, format!("\u{25b7} you: {text}"));
@@ -179,6 +194,15 @@ impl Engine {
                 .status();
         }
         self.answerers.remove(&id);
+    }
+
+    /// Kill every agent. Persistent agents won't exit on their own, so call this
+    /// before dropping the engine (e.g. on quit) to avoid lingering processes.
+    pub fn shutdown(&mut self) {
+        let ids: Vec<AgentId> = self.pids.keys().copied().collect();
+        for id in ids {
+            self.kill(id);
+        }
     }
 
     /// Join all reader threads (call once agents are terminal / on shutdown).

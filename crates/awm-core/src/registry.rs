@@ -311,6 +311,10 @@ fn transcript_lines(event: &AgentEvent) -> Vec<TranscriptLine> {
             K::Note,
             if *approved { "✓ approved" } else { "✗ denied" },
         )],
+        // A turn ended but the session lives on — a divider, ready for the next.
+        AgentEvent::TurnEnded { .. } => {
+            vec![TranscriptLine::new(K::System, "─".repeat(24))]
+        }
         AgentEvent::Finished { ok } => vec![TranscriptLine::new(
             K::System,
             if *ok { "● done" } else { "● failed" },

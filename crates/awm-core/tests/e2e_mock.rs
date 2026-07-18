@@ -36,7 +36,7 @@ fn agents_block_promote_to_master_then_resume_on_approve() {
     let mut engine = Engine::new();
     let ids: Vec<AgentId> = ["a", "b", "c"]
         .iter()
-        .map(|n| engine.spawn(mock_spec(), *n, Tags::empty(), None, false).unwrap())
+        .map(|n| engine.spawn(mock_spec(), *n, Tags::empty(), None, false, false).unwrap())
         .collect();
 
     // All three reach the approval gate.
@@ -80,7 +80,7 @@ fn agents_block_promote_to_master_then_resume_on_approve() {
 fn dead_agent_becomes_failed_not_stuck() {
     let mut engine = Engine::new();
     let id = engine
-        .spawn(script_spec("mock-die.py"), "dying", Tags::empty(), None, false)
+        .spawn(script_spec("mock-die.py"), "dying", Tags::empty(), None, false, false)
         .unwrap();
 
     let terminal = pump_until(&mut engine, |e| {
@@ -101,7 +101,7 @@ fn scale_twelve_agents_block_and_resume() {
     let ids: Vec<AgentId> = (0..12)
         .map(|i| {
             engine
-                .spawn(mock_spec(), format!("a{i}"), Tags::empty(), None, false)
+                .spawn(mock_spec(), format!("a{i}"), Tags::empty(), None, false, false)
                 .unwrap()
         })
         .collect();
@@ -131,7 +131,7 @@ fn scale_twelve_agents_block_and_resume() {
 fn noisy_stream_still_reaches_done() {
     let mut engine = Engine::new();
     let id = engine
-        .spawn(script_spec("mock-noisy.py"), "noisy", Tags::empty(), None, false)
+        .spawn(script_spec("mock-noisy.py"), "noisy", Tags::empty(), None, false, false)
         .unwrap();
 
     let blocked = pump_until(&mut engine, |e| e.registry().pending_request_id(id).is_some());
@@ -153,6 +153,7 @@ fn multi_turn_dialogue_shows_replies_in_the_window() {
             "chat",
             Tags::empty(),
             Some("hello".into()),
+            false,
             false,
         )
         .unwrap();
@@ -181,10 +182,39 @@ fn multi_turn_dialogue_shows_replies_in_the_window() {
 }
 
 #[test]
+fn persistent_agent_survives_per_turn_results() {
+    let mut engine = Engine::new();
+    // persistent = true: a per-turn `result` must NOT terminalize the agent.
+    let id = engine
+        .spawn(script_spec("mock-convo.py"), "convo", Tags::empty(), None, false, true)
+        .unwrap();
+
+    let tail_has = |e: &Engine, needle: &str| {
+        e.registry()
+            .record(id)
+            .map(|r| r.tail.iter().any(|l| l.text.contains(needle)))
+            .unwrap_or(false)
+    };
+
+    engine.send_message(id, "one").unwrap();
+    assert!(pump_until(&mut engine, |e| tail_has(e, "echo: one")));
+    // Turn 1's `result` left the agent alive (not Done).
+    assert!(!engine.registry().record(id).unwrap().state.is_terminal());
+
+    // The follow-up reaches the STILL-LIVE agent — the thing that was broken.
+    engine.send_message(id, "two").unwrap();
+    assert!(pump_until(&mut engine, |e| tail_has(e, "echo: two")));
+    assert!(!engine.registry().record(id).unwrap().state.is_terminal());
+
+    engine.shutdown(); // kills it; only now does it terminate
+    engine.join();
+}
+
+#[test]
 fn streamed_reply_finalizes_to_single_line() {
     let mut engine = Engine::new();
     let id = engine
-        .spawn(script_spec("mock-stream.py"), "s", Tags::empty(), None, false)
+        .spawn(script_spec("mock-stream.py"), "s", Tags::empty(), None, false, false)
         .unwrap();
 
     assert!(pump_until(&mut engine, |e| e.registry().all_terminal()));
@@ -207,7 +237,7 @@ fn streamed_reply_finalizes_to_single_line() {
 fn work_agent_renders_tool_call_result_and_markdown() {
     let mut engine = Engine::new();
     let id = engine
-        .spawn(script_spec("mock-work.py"), "w", Tags::empty(), None, false)
+        .spawn(script_spec("mock-work.py"), "w", Tags::empty(), None, false, false)
         .unwrap();
 
     assert!(pump_until(&mut engine, |e| e.registry().all_terminal()));
@@ -228,7 +258,7 @@ fn work_agent_renders_tool_call_result_and_markdown() {
 fn killing_a_blocked_agent_makes_it_terminal() {
     let mut engine = Engine::new();
     let id = engine
-        .spawn(mock_spec(), "victim", Tags::empty(), None, false)
+        .spawn(mock_spec(), "victim", Tags::empty(), None, false, false)
         .unwrap();
 
     // Let it reach the gate (it then blocks forever waiting on stdin).
@@ -253,7 +283,7 @@ fn killing_a_blocked_agent_makes_it_terminal() {
 #[test]
 fn denying_makes_the_agent_fail() {
     let mut engine = Engine::new();
-    let id = engine.spawn(mock_spec(), "d", Tags::empty(), None, false).unwrap();
+    let id = engine.spawn(mock_spec(), "d", Tags::empty(), None, false, false).unwrap();
 
     assert!(pump_until(&mut engine, |e| e
         .registry()

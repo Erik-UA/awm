@@ -34,6 +34,8 @@ enum Spawn {
     MockWork,
     /// A mock that streams its reply token-by-token (for the streaming demo).
     MockStream,
+    /// A persistent per-turn mock (real-claude-like multi-turn; for the convo demo).
+    MockConvo,
     Claude(String),
 }
 
@@ -68,12 +70,14 @@ fn mock_script() -> PathBuf {
 
 /// Build the spawn spec for `kind`: the command, an optional initial prompt, and
 /// whether it needs the control-protocol `initialize` handshake (real claude does).
-fn spec_for(kind: &Spawn) -> (CommandSpec, Option<String>, bool) {
+fn spec_for(kind: &Spawn) -> (CommandSpec, Option<String>, bool, bool) {
+    // returns (spec, initial prompt, needs-initialize-handshake, persistent-session)
     match kind {
         Spawn::Mock => (
             CommandSpec::new("python3", std::env::temp_dir())
                 .arg(mock_script().to_string_lossy().to_string()),
             None,
+            false,
             false,
         ),
         Spawn::MockChat => {
@@ -83,6 +87,7 @@ fn spec_for(kind: &Spawn) -> (CommandSpec, Option<String>, bool) {
                 CommandSpec::new("python3", std::env::temp_dir())
                     .arg(script.to_string_lossy().to_string()),
                 Some("hello".into()),
+                false,
                 false,
             )
         }
@@ -94,6 +99,7 @@ fn spec_for(kind: &Spawn) -> (CommandSpec, Option<String>, bool) {
                     .arg(script.to_string_lossy().to_string()),
                 None,
                 false,
+                false,
             )
         }
         Spawn::MockStream => {
@@ -104,14 +110,27 @@ fn spec_for(kind: &Spawn) -> (CommandSpec, Option<String>, bool) {
                     .arg(script.to_string_lossy().to_string()),
                 None,
                 false,
+                false,
+            )
+        }
+        Spawn::MockConvo => {
+            let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/mock-convo.py");
+            (
+                CommandSpec::new("python3", std::env::temp_dir())
+                    .arg(script.to_string_lossy().to_string()),
+                None,
+                false,
+                true,
             )
         }
         Spawn::Claude(prompt) => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
             // `--permission-prompt-tool stdio` routes approval gates to us over the
             // control channel as `can_use_tool` requests (see docs/approval-findings.md).
+            // No `-p`: a persistent streaming session that stays alive across
+            // turns (like the Agent SDK). stdin is closed on shutdown to end it.
             let spec = CommandSpec::new("claude", cwd)
-                .arg("-p")
                 .arg("--input-format")
                 .arg("stream-json")
                 .arg("--output-format")
@@ -119,9 +138,9 @@ fn spec_for(kind: &Spawn) -> (CommandSpec, Option<String>, bool) {
                 .arg("--verbose")
                 .arg("--permission-prompt-tool")
                 .arg("stdio")
-                // Stream the reply token-by-token into the window.
                 .arg("--include-partial-messages");
-            (spec, Some(prompt.clone()), true)
+            let prompt = if prompt.is_empty() { None } else { Some(prompt.clone()) };
+            (spec, prompt, true, true)
         }
     }
 }
@@ -147,6 +166,7 @@ fn main() -> std::io::Result<()> {
             "--chat" => roster.push(Spawn::MockChat),
             "--work" => roster.push(Spawn::MockWork),
             "--stream" => roster.push(Spawn::MockStream),
+            "--convo" => roster.push(Spawn::MockConvo),
             _ => {}
         }
     }
@@ -160,8 +180,8 @@ fn main() -> std::io::Result<()> {
 fn run_demo() -> std::io::Result<()> {
     let mut engine = Engine::new();
     for name in ["builder", "cleaner", "tester"] {
-        let (spec, prompt, handshake) = spec_for(&Spawn::Mock);
-        engine.spawn(spec, name, Tags::empty(), prompt, handshake)?;
+        let (spec, prompt, handshake, persistent) = spec_for(&Spawn::Mock);
+        engine.spawn(spec, name, Tags::empty(), prompt, handshake, persistent)?;
     }
     let ids: Vec<AgentId> = engine.registry().order().to_vec();
     let mut tui = AwmTui::new(TestBackend::new(92, 18))?;
@@ -191,15 +211,16 @@ fn run_demo() -> std::io::Result<()> {
 fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
     let mut engine = Engine::new();
     for (i, kind) in roster.iter().enumerate() {
-        let (spec, prompt, handshake) = spec_for(kind);
+        let (spec, prompt, handshake, persistent) = spec_for(kind);
         let name = match kind {
             Spawn::Mock => format!("mock-{i}"),
             Spawn::MockChat => format!("chat-{i}"),
             Spawn::MockWork => format!("work-{i}"),
             Spawn::MockStream => format!("stream-{i}"),
+            Spawn::MockConvo => format!("convo-{i}"),
             Spawn::Claude(_) => format!("claude-{i}"),
         };
-        engine.spawn(spec, name, Tags::empty(), prompt, handshake)?;
+        engine.spawn(spec, name, Tags::empty(), prompt, handshake, persistent)?;
     }
     // Remember what Mod+p should spawn (first roster kind, or Mock).
     let spawn_kind = roster.first().cloned().unwrap_or(Spawn::Mock);
@@ -280,6 +301,7 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
         let bar = input.as_ref().map(|i| i.bar());
         tui.draw(&engine.registry().views(), &layout, focus, bar.as_deref())?;
     }
+    engine.shutdown();
     Ok(())
 }
 
@@ -291,10 +313,11 @@ fn spawn_typed(engine: &mut Engine, kind: &Spawn, text: String) {
         Spawn::MockChat => Spawn::MockChat,
         Spawn::MockWork => Spawn::MockWork,
         Spawn::MockStream => Spawn::MockStream,
+        Spawn::MockConvo => Spawn::MockConvo,
         Spawn::Mock => Spawn::Mock,
     };
-    let (spec, prompt, handshake) = spec_for(&spawn);
-    let _ = engine.spawn(spec, "spawned", Tags::empty(), prompt, handshake);
+    let (spec, prompt, handshake, persistent) = spec_for(&spawn);
+    let _ = engine.spawn(spec, "spawned", Tags::empty(), prompt, handshake, persistent);
 }
 
 fn handle_action(action: Action, engine: &mut Engine, mode: &mut LayoutMode, spawn_kind: &Spawn) {
@@ -318,8 +341,8 @@ fn handle_action(action: Action, engine: &mut Engine, mode: &mut LayoutMode, spa
             }
         }
         Action::SpawnPrompt => {
-            let (spec, prompt, handshake) = spec_for(spawn_kind);
-            let _ = engine.spawn(spec, "spawned", Tags::empty(), prompt, handshake);
+            let (spec, prompt, handshake, persistent) = spec_for(spawn_kind);
+            let _ = engine.spawn(spec, "spawned", Tags::empty(), prompt, handshake, persistent);
         }
         Action::Approve => answer_target(engine, Decision::Allow),
         Action::Deny => answer_target(engine, Decision::Deny("denied from awm".into())),
