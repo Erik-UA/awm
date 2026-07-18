@@ -27,6 +27,9 @@ pub struct CoreEvent {
     pub event: AgentEvent,
     /// The `Task` tool id whose sub-agent produced this event, if any.
     pub parent_tool_use_id: Option<String>,
+    /// The `tool_use.id` of a `ToolStarted` event — records which pane owns the
+    /// tool so its later approval gate routes there.
+    pub tool_use_id: Option<String>,
     /// Set when this event is a `Task` call that spawns a sub-agent.
     pub spawn: Option<Spawn>,
 }
@@ -44,6 +47,12 @@ pub struct Engine {
     /// Root (process) id → every sub-agent pane spawned under it, so they can be
     /// retired together when the root's turn ends.
     descendants: HashMap<AgentId, Vec<AgentId>>,
+    /// `tool_use.id` → the pane that owns that tool call, so a later
+    /// `can_use_tool` gate (which references the id) routes to that pane.
+    tool_owner: HashMap<String, AgentId>,
+    /// Sub-agent pane → its root process id (which owns the real Answerer), so a
+    /// child pane's approval answer is written to the root process's stdin.
+    parent_of: HashMap<AgentId, AgentId>,
 }
 
 impl Default for Engine {
@@ -64,6 +73,8 @@ impl Engine {
             readers: Vec::new(),
             child_by_tool: HashMap::new(),
             descendants: HashMap::new(),
+            tool_owner: HashMap::new(),
+            parent_of: HashMap::new(),
         }
     }
 
@@ -129,6 +140,7 @@ impl Engine {
                                     id,
                                     event,
                                     parent_tool_use_id: routed.parent_tool_use_id,
+                                    tool_use_id: routed.tool_use_id,
                                     spawn: routed.spawn,
                                 })
                                 .is_err()
@@ -148,6 +160,7 @@ impl Engine {
                 id,
                 event: AgentEvent::Finished { ok: code == 0 },
                 parent_tool_use_id: None,
+                tool_use_id: None,
                 spawn: None,
             });
         });
@@ -181,16 +194,26 @@ impl Engine {
     /// events (tagged with `parent_tool_use_id`) land in that child; when the
     /// root process's turn ends, its sub-agent panes are retired.
     fn route(&mut self, ce: CoreEvent) {
-        // Resolve the target pane: a sub-agent's own id if this event belongs to
-        // one, else the root process id.
-        let target = ce
-            .parent_tool_use_id
-            .as_ref()
-            .and_then(|tid| self.child_by_tool.get(tid).copied())
-            .unwrap_or(ce.id);
+        // Resolve the target pane. An approval gate carries no `parent_tool_use_id`
+        // (the `can_use_tool` envelope lacks it), so route it by the owning tool:
+        // its `ctx.tool_use_id` is the id of a `tool_use` we already routed to a
+        // pane. Other events route by `parent_tool_use_id` to the sub-agent pane,
+        // else to the root process.
+        let target = match &ce.event {
+            AgentEvent::ApprovalRequested(ctx) => ctx
+                .tool_use_id
+                .as_ref()
+                .and_then(|tid| self.tool_owner.get(tid).copied())
+                .unwrap_or(ce.id),
+            _ => ce
+                .parent_tool_use_id
+                .as_ref()
+                .and_then(|tid| self.child_by_tool.get(tid).copied())
+                .unwrap_or(ce.id),
+        };
 
-        // A `Task` tool_use spawns a sub-agent pane, inserted right after the
-        // pane that spawned it so it sits adjacent in the stack.
+        // A `Task`/`Agent` tool_use spawns a sub-agent pane, inserted right after
+        // the pane that spawned it so it sits adjacent in the stack.
         if let Some(spawn) = &ce.spawn {
             if !self.child_by_tool.contains_key(&spawn.tool_use_id) {
                 let child = self.reg.alloc_id();
@@ -203,6 +226,14 @@ impl Engine {
                 self.reg.add_after(target, AgentMeta::new(child, name, cwd, 0));
                 self.child_by_tool.insert(spawn.tool_use_id.clone(), child);
                 self.descendants.entry(ce.id).or_default().push(child);
+                self.parent_of.insert(child, ce.id);
+            }
+        }
+
+        // Remember which pane owns this tool call, so its later approval routes here.
+        if matches!(ce.event, AgentEvent::ToolStarted { .. }) {
+            if let Some(tid) = &ce.tool_use_id {
+                self.tool_owner.insert(tid.clone(), target);
             }
         }
 
@@ -222,6 +253,8 @@ impl Engine {
                     self.reg.remove(child);
                 }
                 self.child_by_tool.retain(|_, v| !removed.contains(v));
+                self.parent_of.retain(|c, _| !removed.contains(c));
+                self.tool_owner.retain(|_, v| !removed.contains(v));
             }
         }
     }
@@ -230,12 +263,22 @@ impl Engine {
     /// agent's stdin and — because we generate that response ourselves, so it
     /// never comes back on stdout — synthesizes the matching `ApprovalResolved`
     /// into the registry to unblock the agent.
+    ///
+    /// `id` may be a sub-agent pane, which has no process of its own: its gate is
+    /// answered on the ROOT process's Answerer (all sub-agents share it), using the
+    /// pane's own pending `request_id`.
     pub fn answer(&mut self, id: AgentId, decision: Decision) -> std::io::Result<()> {
         let Some(request_id) = self.reg.pending_request_id(id) else {
             return Ok(()); // nothing pending
         };
+        // A sub-agent pane's stdin lives on its root process.
+        let proc = if self.answerers.contains_key(&id) {
+            id
+        } else {
+            self.parent_of.get(&id).copied().unwrap_or(id)
+        };
         let approved = matches!(decision, Decision::Allow);
-        if let Some(answerer) = self.answerers.get(&id) {
+        if let Some(answerer) = self.answerers.get(&proc) {
             answerer.answer(&request_id, decision)?;
         }
         self.reg
@@ -318,7 +361,42 @@ mod tests {
             id,
             event,
             parent_tool_use_id: parent.map(str::to_string),
+            tool_use_id: None,
             spawn,
+        }
+    }
+
+    /// A `ToolStarted` event carrying its `tool_use_id` (for gate correlation).
+    fn tool_ev(id: AgentId, name: &str, tool_use_id: &str, parent: Option<&str>) -> CoreEvent {
+        CoreEvent {
+            id,
+            event: AgentEvent::ToolStarted {
+                name: name.into(),
+                summary: String::new(),
+            },
+            parent_tool_use_id: parent.map(str::to_string),
+            tool_use_id: Some(tool_use_id.to_string()),
+            spawn: None,
+        }
+    }
+
+    /// An `ApprovalRequested` gate referencing `tool_use_id` (no parent id, as in
+    /// the real `can_use_tool` envelope).
+    fn gate_ev(id: AgentId, tool_use_id: &str, request_id: &str) -> CoreEvent {
+        CoreEvent {
+            id,
+            event: AgentEvent::ApprovalRequested(awm_proto::ApprovalCtx {
+                tool: "Bash".into(),
+                input: serde_json::Value::Null,
+                request_id: request_id.into(),
+                tool_use_id: Some(tool_use_id.into()),
+                description: None,
+                decision_reason: None,
+                diff: None,
+            }),
+            parent_tool_use_id: None,
+            tool_use_id: None,
+            spawn: None,
         }
     }
 
@@ -414,5 +492,58 @@ mod tests {
         engine.route(ev(root, tool(), None, spawn()));
         engine.route(ev(root, tool(), None, spawn()));
         assert_eq!(engine.registry().order().len(), 2, "only one child pane");
+    }
+
+    /// Two sub-agents each blocking on a gate: each approval must land in its OWN
+    /// child pane (not collide on the root), and each pane maps back to the root.
+    #[test]
+    fn subagent_gates_route_to_their_own_panes() {
+        let mut engine = Engine::new();
+        let root = engine.registry_mut().alloc_id();
+        engine
+            .registry_mut()
+            .add(AgentMeta::new(root, "root", PathBuf::from("/tmp"), 0));
+
+        // Two Agent spawns → two child panes.
+        for (tid, desc) in [("toolu_a1", "run parser tests"), ("toolu_a2", "run core tests")] {
+            engine.route(ev(
+                root,
+                AgentEvent::ToolStarted { name: "Agent".into(), summary: desc.into() },
+                None,
+                Some(Spawn { tool_use_id: tid.into(), description: desc.into() }),
+            ));
+        }
+        let order = engine.registry().order().to_vec();
+        assert_eq!(order.len(), 3, "root + two children");
+        let child1 = *engine.child_by_tool.get("toolu_a1").unwrap();
+        let child2 = *engine.child_by_tool.get("toolu_a2").unwrap();
+
+        // Each sub-agent runs an inner Bash tool (routed to its pane via the
+        // spawn's parent_tool_use_id), then that tool blocks on a gate.
+        engine.route(tool_ev(root, "Bash", "toolu_b1", Some("toolu_a1")));
+        engine.route(tool_ev(root, "Bash", "toolu_b2", Some("toolu_a2")));
+        engine.route(gate_ev(root, "toolu_b1", "req-1"));
+        engine.route(gate_ev(root, "toolu_b2", "req-2"));
+
+        // Each gate landed in its own child pane — not on the root.
+        assert_eq!(engine.reg.pending_request_id(child1).as_deref(), Some("req-1"));
+        assert_eq!(engine.reg.pending_request_id(child2).as_deref(), Some("req-2"));
+        assert_eq!(engine.reg.pending_request_id(root), None, "root not blocked");
+        assert!(engine.registry().record(child1).unwrap().meta.urgent);
+        assert!(engine.registry().record(child2).unwrap().meta.urgent);
+
+        // Each child pane maps back to the root process (for answering).
+        assert_eq!(engine.parent_of.get(&child1), Some(&root));
+        assert_eq!(engine.parent_of.get(&child2), Some(&root));
+
+        // Answering a child pane clears ITS block (and doesn't panic without a
+        // real Answerer — the write is a no-op in the test).
+        engine.answer(child1, Decision::Allow).unwrap();
+        assert_eq!(engine.reg.pending_request_id(child1), None, "child1 unblocked");
+        assert_eq!(
+            engine.reg.pending_request_id(child2).as_deref(),
+            Some("req-2"),
+            "child2 still blocked"
+        );
     }
 }

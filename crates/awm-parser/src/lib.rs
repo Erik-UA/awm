@@ -38,6 +38,10 @@ use std::collections::VecDeque;
 pub struct Routed {
     pub event: AgentEvent,
     pub parent_tool_use_id: Option<String>,
+    /// The `tool_use.id` of a `ToolStarted` event (`None` otherwise). Lets the
+    /// core map a later `can_use_tool` gate (which references this id) back to
+    /// the pane that owns the tool.
+    pub tool_use_id: Option<String>,
     pub spawn: Option<Spawn>,
 }
 
@@ -68,24 +72,26 @@ impl StreamParser {
         Self::default()
     }
 
-    /// Enqueue an event, tagged with the current line's `parent_tool_use_id`.
-    fn emit(&mut self, event: AgentEvent) {
+    /// Enqueue an event, tagged with the current line's `parent_tool_use_id`
+    /// plus optional per-tool routing (`tool_use_id`, sub-agent `spawn`).
+    fn emit_routed(
+        &mut self,
+        event: AgentEvent,
+        tool_use_id: Option<String>,
+        spawn: Option<Spawn>,
+    ) {
         let parent_tool_use_id = self.cur_parent.clone();
         self.ready.push_back(Routed {
             event,
             parent_tool_use_id,
-            spawn: None,
+            tool_use_id,
+            spawn,
         });
     }
 
-    /// Enqueue an event that also spawns a sub-agent (a `Task` tool call).
-    fn emit_spawn(&mut self, event: AgentEvent, spawn: Spawn) {
-        let parent_tool_use_id = self.cur_parent.clone();
-        self.ready.push_back(Routed {
-            event,
-            parent_tool_use_id,
-            spawn: Some(spawn),
-        });
+    /// Enqueue a plain event (no per-tool routing).
+    fn emit(&mut self, event: AgentEvent) {
+        self.emit_routed(event, None, None);
     }
 
     /// Feed a chunk of raw output. Complete (newline-terminated) lines are
@@ -215,14 +221,16 @@ impl StreamParser {
                             .unwrap_or_default()
                             .to_string();
                         let summary = summarize_tool_input(&name, block.get("input"));
+                        let tid = block.get("id").and_then(Value::as_str).map(str::to_string);
                         // A sub-agent-spawning tool_use (`Agent`/`Task`) carries its
                         // id + description out-of-band so the core can mint a child
-                        // pane.
+                        // pane. Every tool_use also exposes its `tool_use_id` so the
+                        // core can later route the tool's approval gate.
                         let spawn = is_subagent_tool(&name, block.get("input"))
-                            .then(|| block.get("id").and_then(Value::as_str))
+                            .then(|| tid.clone())
                             .flatten()
-                            .map(|tid| Spawn {
-                                tool_use_id: tid.to_string(),
+                            .map(|tool_use_id| Spawn {
+                                tool_use_id,
                                 description: block
                                     .get("input")
                                     .and_then(|i| i.get("description"))
@@ -231,12 +239,7 @@ impl StreamParser {
                                     .unwrap_or("subagent")
                                     .to_string(),
                             });
-                        match spawn {
-                            Some(s) => {
-                                self.emit_spawn(AgentEvent::ToolStarted { name, summary }, s)
-                            }
-                            None => self.emit(AgentEvent::ToolStarted { name, summary }),
-                        }
+                        self.emit_routed(AgentEvent::ToolStarted { name, summary }, tid, spawn);
                     }
                     // Other block kinds (e.g. tool_result echoes) carry no event.
                     _ => {}
@@ -712,6 +715,20 @@ mod tests {
             })
             .expect("nested message present");
         assert_eq!(nested.parent_tool_use_id.as_deref(), Some("toolu_9"));
+    }
+
+    #[test]
+    fn tool_use_exposes_its_id_for_gate_correlation() {
+        let mut p = StreamParser::new();
+        p.feed(br#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"cargo test"}}]}}
+"#);
+        let routed: Vec<Routed> = std::iter::from_fn(|| p.next_routed()).collect();
+        let ts = routed
+            .iter()
+            .find(|r| matches!(r.event, AgentEvent::ToolStarted { .. }))
+            .expect("ToolStarted present");
+        assert_eq!(ts.tool_use_id.as_deref(), Some("toolu_bash"));
+        assert!(ts.spawn.is_none());
     }
 
     #[test]
