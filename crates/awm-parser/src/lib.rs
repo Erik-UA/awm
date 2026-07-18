@@ -28,11 +28,12 @@ use serde_json::Value;
 use std::collections::VecDeque;
 
 /// A parsed [`AgentEvent`] plus sub-agent correlation that can't ride on the
-/// frozen `AgentEvent` types. `parent_tool_use_id` is the `Task` `tool_use.id`
-/// whose sub-agent produced this event (`None` for the root agent's own
-/// output). `spawn` is set only on the `ToolStarted` event of a `Task` call and
-/// carries the freshly-spawned sub-agent's tool id + description. Consumers that
-/// don't care about sub-agents keep using [`EventSource::next_event`].
+/// frozen `AgentEvent` types. `parent_tool_use_id` is the sub-agent tool's
+/// (`Agent`/`Task`) `tool_use.id` whose sub-agent produced this event (`None`
+/// for the root agent's own output). `spawn` is set only on the `ToolStarted`
+/// event of such a call and carries the freshly-spawned sub-agent's tool id +
+/// description. Consumers that don't care about sub-agents keep using
+/// [`EventSource::next_event`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Routed {
     pub event: AgentEvent,
@@ -40,10 +41,10 @@ pub struct Routed {
     pub spawn: Option<Spawn>,
 }
 
-/// A `Task` tool call that spawns a sub-agent.
+/// An `Agent`/`Task` tool call that spawns a sub-agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Spawn {
-    /// The `tool_use.id` of the `Task` call; later nested messages reference it
+    /// The `tool_use.id` of the spawning call; later nested messages reference it
     /// via `parent_tool_use_id`.
     pub tool_use_id: String,
     /// The sub-agent's task description (from the `Task` input), for its label.
@@ -214,9 +215,10 @@ impl StreamParser {
                             .unwrap_or_default()
                             .to_string();
                         let summary = summarize_tool_input(&name, block.get("input"));
-                        // A `Task` tool_use spawns a sub-agent: carry its id +
-                        // description out-of-band so the core can mint a child pane.
-                        let spawn = (name == "Task")
+                        // A sub-agent-spawning tool_use (`Agent`/`Task`) carries its
+                        // id + description out-of-band so the core can mint a child
+                        // pane.
+                        let spawn = is_subagent_tool(&name, block.get("input"))
                             .then(|| block.get("id").and_then(Value::as_str))
                             .flatten()
                             .map(|tid| Spawn {
@@ -414,6 +416,14 @@ fn string_array(value: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether a `tool_use` spawns a sub-agent. The tool is named `Agent` in current
+/// `claude` and `Task` in older builds; as a rename-proof fallback, any tool whose
+/// input carries a `subagent_type` field counts (only the sub-agent tool has it).
+fn is_subagent_tool(name: &str, input: Option<&Value>) -> bool {
+    matches!(name, "Task" | "Agent")
+        || input.and_then(|i| i.get("subagent_type")).is_some()
+}
+
 /// A one-line preview of a tool's input, like Claude Code's `Tool(summary)`.
 /// Picks the most meaningful field per tool, falling back to compact JSON.
 fn summarize_tool_input(name: &str, input: Option<&Value>) -> String {
@@ -425,7 +435,7 @@ fn summarize_tool_input(name: &str, input: Option<&Value>) -> String {
         "Bash" => field("command"),
         "Read" | "Edit" | "Write" | "NotebookEdit" => field("file_path"),
         "Grep" | "Glob" => field("pattern"),
-        "Task" => field("description"),
+        "Task" | "Agent" => field("description"),
         "WebFetch" => field("url"),
         "WebSearch" => field("query"),
         _ => "",
@@ -668,6 +678,40 @@ mod tests {
             })
             .expect("root follow-up message present");
         assert_eq!(root_msg.parent_tool_use_id, None);
+    }
+
+    #[test]
+    fn agent_tool_spawns_and_nested_output_routes() {
+        // The real `claude` names the sub-agent tool `Agent` (with a
+        // `subagent_type` input) and puts `parent_tool_use_id` at the top level.
+        let mut p = StreamParser::new();
+        p.feed(br#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_9","name":"Agent","input":{"description":"run parser tests","prompt":"cargo test -p awm-parser","subagent_type":"general-purpose"}}]}}
+{"type":"assistant","parent_tool_use_id":"toolu_9","message":{"content":[{"type":"text","text":"Running the parser tests..."}]}}
+"#);
+        let routed: Vec<Routed> = std::iter::from_fn(|| p.next_routed()).collect();
+
+        let spawn = routed
+            .iter()
+            .find_map(|r| r.spawn.clone())
+            .expect("Agent tool should carry a Spawn");
+        assert_eq!(spawn.tool_use_id, "toolu_9");
+        assert_eq!(spawn.description, "run parser tests");
+
+        // The summary is the description, not raw JSON.
+        assert!(routed.iter().any(|r| r.event
+            == AgentEvent::ToolStarted {
+                name: "Agent".into(),
+                summary: "run parser tests".into(),
+            }));
+
+        // Nested sub-agent output (top-level parent_tool_use_id) is attributed.
+        let nested = routed
+            .iter()
+            .find(|r| r.event == AgentEvent::Message {
+                text: "Running the parser tests...".into(),
+            })
+            .expect("nested message present");
+        assert_eq!(nested.parent_tool_use_id.as_deref(), Some("toolu_9"));
     }
 
     #[test]

@@ -38,6 +38,9 @@ enum Spawn {
     MockConvo,
     /// A mock that replies with a markdown table (for the full-markdown demo).
     MockMd,
+    /// A mock that spawns two sub-agents via the `Agent` tool (for the
+    /// sub-agent-panes demo).
+    MockSubagents,
     Claude(String),
 }
 
@@ -149,6 +152,17 @@ fn spec_for(kind: &Spawn) -> (CommandSpec, Option<String>, bool, bool) {
                 false,
             )
         }
+        Spawn::MockSubagents => {
+            let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/mock-subagents.py");
+            (
+                CommandSpec::new("python3", std::env::temp_dir())
+                    .arg(script.to_string_lossy().to_string()),
+                None,
+                false,
+                false,
+            )
+        }
         Spawn::Claude(prompt) => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
             // `--permission-prompt-tool stdio` routes approval gates to us over the
@@ -193,6 +207,7 @@ fn main() -> std::io::Result<()> {
             "--stream" => roster.push(Spawn::MockStream),
             "--convo" => roster.push(Spawn::MockConvo),
             "--md" => roster.push(Spawn::MockMd),
+            "--subagents" => roster.push(Spawn::MockSubagents),
             _ => {}
         }
     }
@@ -245,6 +260,7 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
             Spawn::MockStream => format!("stream-{i}"),
             Spawn::MockConvo => format!("convo-{i}"),
             Spawn::MockMd => format!("md-{i}"),
+            Spawn::MockSubagents => format!("subs-{i}"),
             Spawn::Claude(_) => format!("claude-{i}"),
         };
         engine.spawn(spec, name, Tags::empty(), prompt, handshake, persistent)?;
@@ -399,6 +415,7 @@ fn spawn_typed(engine: &mut Engine, kind: &Spawn, text: String) {
         Spawn::MockStream => Spawn::MockStream,
         Spawn::MockConvo => Spawn::MockConvo,
         Spawn::MockMd => Spawn::MockMd,
+        Spawn::MockSubagents => Spawn::MockSubagents,
         Spawn::Mock => Spawn::Mock,
     };
     let (spec, prompt, handshake, persistent) = spec_for(&spawn);
