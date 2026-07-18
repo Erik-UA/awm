@@ -31,6 +31,9 @@ indented `⎿` tool output, and markdown answers (headers, bullets, code):
 • 2 entries, incl. a `src` directory
 ```
 
+Replies **stream in token-by-token** (via `--include-partial-messages`), so the
+window types out live like a real Claude session.
+
 Press `y` to approve the master agent, `n` to deny — the response goes back over
 the agent's control channel and it resumes. No entering the session. Press `i` to
 send a follow-up message to the focused agent and watch its reply in the window
