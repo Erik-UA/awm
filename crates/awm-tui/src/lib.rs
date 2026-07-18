@@ -123,13 +123,105 @@ fn render_into(
     }
 }
 
-/// The agent inspection card (model / mode / tools / skills / …). **Stub —
-/// Track B implements.** For now it shows a placeholder so the surface compiles.
+/// The agent inspection card (model / mode / tools / skills / …), parsed from
+/// the `init` metadata. Bordered panel titled with the agent name; body shows
+/// the model and permission mode, then one labelled section per capability list
+/// (tools / skills / plugins / slash-commands / subagents), each wrapped to fit.
 fn render_card(frame: &mut Frame, view: &AgentView, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {} — inspect ", view.meta.name));
-    frame.render_widget(Paragraph::new("(agent card — Track B)").block(block), area);
+
+    let Some(info) = &view.info else {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "no metadata yet",
+                Style::default().fg(Color::DarkGray),
+            ))
+            .block(block),
+            area,
+        );
+        return;
+    };
+
+    // Width available for text inside the border.
+    let inner = area.width.saturating_sub(2) as usize;
+    let key = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+
+    let field = |label: &str, val: &str| {
+        Line::from(vec![
+            Span::styled(format!("{label}: "), key),
+            Span::raw(val.to_string()),
+        ])
+    };
+
+    let mut body: Vec<Line> = vec![
+        field("model", &info.model),
+        field(
+            "permission mode",
+            if info.permission_mode.is_empty() {
+                "-"
+            } else {
+                &info.permission_mode
+            },
+        ),
+    ];
+
+    // One section per capability list: a bold/cyan `Header (N):` line, then the
+    // comma-joined names wrapped across as many lines as needed.
+    let sections: [(&str, &[String]); 5] = [
+        ("Tools", &info.tools),
+        ("Skills", &info.skills),
+        ("Plugins", &info.plugins),
+        ("Slash-commands", &info.slash_commands),
+        ("Subagents", &info.agents),
+    ];
+    for (label, items) in sections {
+        body.push(Line::from(String::new()));
+        body.push(Line::from(Span::styled(
+            format!("{label} ({}):", items.len()),
+            key,
+        )));
+        if items.is_empty() {
+            body.push(Line::from(Span::styled(
+                "  (none)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for wrapped in wrap_joined(items, ", ", inner) {
+                body.push(Line::from(wrapped));
+            }
+        }
+    }
+
+    frame.render_widget(Paragraph::new(body).block(block), area);
+}
+
+/// Join `items` with `sep` and hard-wrap the result so no line exceeds `width`
+/// columns. Individual items longer than `width` occupy their own line (never
+/// split mid-item). Returns at least one (possibly empty) line.
+fn wrap_joined(items: &[String], sep: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for (idx, item) in items.iter().enumerate() {
+        let piece = if idx + 1 < items.len() {
+            format!("{item}{sep}")
+        } else {
+            item.clone()
+        };
+        if !cur.is_empty() && cur.chars().count() + piece.chars().count() > width {
+            lines.push(std::mem::take(&mut cur));
+        }
+        cur.push_str(&piece);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 /// The bottom input bar (the caller supplies the full label + text; a block
@@ -700,5 +792,103 @@ fn state_label(state: AgentState) -> &'static str {
         AgentState::BlockedOnApproval => "BLOCKED",
         AgentState::Done => "done",
         AgentState::Failed => "failed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use awm_proto::{AgentInfo, AgentMeta, TokenUsage};
+    use ratatui::backend::TestBackend;
+
+    /// Render the `TestBackend` buffer to plain text for a stable snapshot.
+    fn buffer_to_string(backend: &TestBackend) -> String {
+        let buf = backend.buffer();
+        let area = *buf.area();
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf.get(x, y).symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn names(prefix: &str, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{prefix}{i}")).collect()
+    }
+
+    fn card_view() -> AgentView {
+        AgentView {
+            meta: AgentMeta {
+                id: AgentId(3),
+                name: "inspector".into(),
+                tags: Tags::empty(),
+                cwd: "/home/dev/proj".into(),
+                started_at: 0,
+                urgent: false,
+            },
+            state: AgentState::Working,
+            tokens: TokenUsage::default(),
+            info: Some(AgentInfo {
+                model: "claude-opus-4-8".into(),
+                permission_mode: "acceptEdits".into(),
+                tools: vec![
+                    "Bash".into(),
+                    "Read".into(),
+                    "Edit".into(),
+                    "Write".into(),
+                    "Grep".into(),
+                    "Glob".into(),
+                ],
+                skills: names("skill-", 16),
+                plugins: vec!["plug-a".into(), "plug-b".into()],
+                slash_commands: vec!["/review".into(), "/test".into(), "/deploy".into()],
+                agents: vec!["Explore".into(), "Plan".into()],
+            }),
+            tail: vec![],
+        }
+    }
+
+    #[test]
+    fn card_renders_populated_info() {
+        let mut tui = AwmTui::new(TestBackend::new(60, 30)).unwrap();
+        let views = vec![card_view()];
+        tui.draw(
+            &views,
+            &LayoutCmd::Monocle(AgentId(3)),
+            Some(AgentId(3)),
+            None,
+            0,
+            true,
+        )
+        .unwrap();
+        insta::assert_snapshot!("card_populated", buffer_to_string(tui.backend()));
+    }
+
+    #[test]
+    fn card_without_info_shows_placeholder() {
+        let mut view = card_view();
+        view.info = None;
+        let mut tui = AwmTui::new(TestBackend::new(40, 8)).unwrap();
+        tui.draw(
+            &[view],
+            &LayoutCmd::Monocle(AgentId(3)),
+            Some(AgentId(3)),
+            None,
+            0,
+            true,
+        )
+        .unwrap();
+        assert!(buffer_to_string(tui.backend()).contains("no metadata yet"));
+    }
+
+    #[test]
+    fn wrap_joined_never_exceeds_width() {
+        let items = names("tool", 20);
+        for line in wrap_joined(&items, ", ", 24) {
+            assert!(line.chars().count() <= 24, "line too wide: {line:?}");
+        }
     }
 }

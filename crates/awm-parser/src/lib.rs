@@ -23,7 +23,7 @@
 
 #![forbid(unsafe_code)]
 
-use awm_proto::{AgentEvent, ApprovalCtx, EventSource, TokenUsage};
+use awm_proto::{AgentEvent, AgentInfo, ApprovalCtx, EventSource, TokenUsage};
 use serde_json::Value;
 use std::collections::VecDeque;
 
@@ -96,6 +96,22 @@ impl StreamParser {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .into();
+            // Full session metadata for the inspection card. `Info` maps to no
+            // state transition, so emitting it alongside `Started` leaves the
+            // collapsed state sequence unchanged.
+            self.ready.push_back(AgentEvent::Info(AgentInfo {
+                model: model.clone(),
+                permission_mode: value
+                    .get("permissionMode")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                tools: string_array(value, "tools"),
+                skills: string_array(value, "skills"),
+                plugins: string_array(value, "plugins"),
+                slash_commands: string_array(value, "slash_commands"),
+                agents: string_array(value, "agents"),
+            }));
             self.ready.push_back(AgentEvent::Started { model, cwd });
         } else {
             // Unknown system subtype: treat as noise rather than guess.
@@ -287,6 +303,21 @@ fn token_usage(usage: &Value) -> TokenUsage {
     }
 }
 
+/// Read a JSON array-of-strings field, dropping non-string entries. A missing
+/// field (or a non-array value) yields an empty vec.
+fn string_array(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// A one-line preview of a tool's input, like Claude Code's `Tool(summary)`.
 /// Picks the most meaningful field per tool, falling back to compact JSON.
 fn summarize_tool_input(name: &str, input: Option<&Value>) -> String {
@@ -373,6 +404,45 @@ mod tests {
             output: "total 4\nfile".into(),
             is_error: false,
         }));
+    }
+
+    #[test]
+    fn init_emits_info_with_metadata_then_started() {
+        let mut p = StreamParser::new();
+        p.feed(br#"{"type":"system","subtype":"init","cwd":"/home/dev/proj","model":"claude-opus-4-8","permissionMode":"acceptEdits","tools":["Bash","Read","Edit"],"skills":["deep-research","dataviz"],"plugins":["p1"],"slash_commands":["/review","/test"],"agents":["Explore","Plan"]}
+"#);
+        let events: Vec<_> = std::iter::from_fn(|| p.next_event()).collect();
+        assert!(events.contains(&AgentEvent::Info(AgentInfo {
+            model: "claude-opus-4-8".into(),
+            permission_mode: "acceptEdits".into(),
+            tools: vec!["Bash".into(), "Read".into(), "Edit".into()],
+            skills: vec!["deep-research".into(), "dataviz".into()],
+            plugins: vec!["p1".into()],
+            slash_commands: vec!["/review".into(), "/test".into()],
+            agents: vec!["Explore".into(), "Plan".into()],
+        })));
+        // Started is still emitted (Info does not replace it).
+        assert!(events.contains(&AgentEvent::Started {
+            model: "claude-opus-4-8".into(),
+            cwd: "/home/dev/proj".into(),
+        }));
+    }
+
+    #[test]
+    fn init_missing_arrays_yield_empty_info() {
+        let mut p = StreamParser::new();
+        p.feed(br#"{"type":"system","subtype":"init","cwd":"/p","model":"m"}
+"#);
+        let events: Vec<_> = std::iter::from_fn(|| p.next_event()).collect();
+        assert!(events.contains(&AgentEvent::Info(AgentInfo {
+            model: "m".into(),
+            permission_mode: String::new(),
+            tools: vec![],
+            skills: vec![],
+            plugins: vec![],
+            slash_commands: vec![],
+            agents: vec![],
+        })));
     }
 
     #[test]
