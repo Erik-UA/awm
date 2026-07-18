@@ -60,8 +60,9 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Home => Some(Action::ScrollTop),
         KeyCode::End => Some(Action::ScrollBottom),
 
-        // Agent inspection card.
-        KeyCode::Char('i') if ctrl => Some(Action::Inspect),
+        // Agent inspection card. Bound to Tab (Ctrl+i and Tab are the same byte
+        // 0x09 in a terminal, which crossterm reports as KeyCode::Tab).
+        KeyCode::Tab => Some(Action::Inspect),
 
         _ => None,
     }
