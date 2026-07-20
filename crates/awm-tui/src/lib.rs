@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
+
 use awm_proto::{AgentId, AgentState, AgentView, LayoutCmd, LineKind, Renderer, Tags, TranscriptLine};
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -161,9 +163,22 @@ impl GateView {
     }
 }
 
+/// Per-frame animation/timing context for the live status indicator: `tick`
+/// advances the spinner phase, `elapsed` maps an agent to the seconds it has
+/// spent in the current active turn. Cheap to copy (holds a shared ref).
+#[derive(Clone, Copy)]
+struct Chrome<'a> {
+    tick: u64,
+    elapsed: &'a HashMap<AgentId, u64>,
+}
+
 /// The TUI renderer, generic over a ratatui backend.
 pub struct AwmTui<B: Backend> {
     terminal: Terminal<B>,
+    /// Spinner phase, advanced by the caller each frame (0 in tests → static).
+    tick: u64,
+    /// Per-agent seconds spent in the current active turn (empty in tests).
+    elapsed: HashMap<AgentId, u64>,
 }
 
 impl<B: Backend> AwmTui<B> {
@@ -172,7 +187,18 @@ impl<B: Backend> AwmTui<B> {
     pub fn new(backend: B) -> std::io::Result<Self> {
         Ok(AwmTui {
             terminal: Terminal::new(backend)?,
+            tick: 0,
+            elapsed: HashMap::new(),
         })
+    }
+
+    /// Feed the live-status animation/timing for the next `draw`: `tick` is a
+    /// monotonically increasing frame counter (spinner phase); `elapsed` maps an
+    /// agent to seconds in its current active turn. Kept off `draw`'s signature
+    /// so existing callers/tests are unaffected (they render a static frame 0).
+    pub fn set_chrome(&mut self, tick: u64, elapsed: HashMap<AgentId, u64>) {
+        self.tick = tick;
+        self.elapsed = elapsed;
     }
 
     /// Borrow the underlying backend — lets tests snapshot a `TestBackend`.
@@ -203,6 +229,12 @@ impl<B: Backend> AwmTui<B> {
         gate_target: Option<AgentId>,
         tabs: &[Tab],
     ) -> std::io::Result<()> {
+        // Borrow the timing fields disjointly from `self.terminal` so the draw
+        // closure can carry them without capturing all of `self`.
+        let chrome = Chrome {
+            tick: self.tick,
+            elapsed: &self.elapsed,
+        };
         self.terminal.draw(|frame| {
             let full = frame.size();
             // Reserve a one-row project tab bar at the very top when there are
@@ -258,7 +290,7 @@ impl<B: Backend> AwmTui<B> {
                 (Some(g), Some(t)) => Some((g, t)),
                 _ => None,
             };
-            render_into(frame, views, layout, focus, scroll, inline, area);
+            render_into(frame, views, layout, focus, scroll, inline, area, chrome);
         })?;
         Ok(())
     }
@@ -545,13 +577,16 @@ fn render_into(
     scroll: u16,
     inline: Option<(&GateView, AgentId)>,
     area: Rect,
+    chrome: Chrome,
 ) {
     match layout {
         LayoutCmd::Monocle(id) => match find(views, *id) {
-            Some(v) => draw_pane(frame, v, focus == Some(v.meta.id), scroll, inline, area),
+            Some(v) => draw_pane(frame, v, focus == Some(v.meta.id), scroll, inline, area, chrome),
             None => draw_empty(frame, area),
         },
-        LayoutCmd::Triage(ids) => draw_triage(frame, views, ids, focus, scroll, inline, area),
+        LayoutCmd::Triage(ids) => {
+            draw_triage(frame, views, ids, focus, scroll, inline, area, chrome)
+        }
         // Both promote a single agent to the master zone; the rest of the roster
         // falls into the side stack in roster order.
         LayoutCmd::SetMaster(id) | LayoutCmd::Focus(id) => {
@@ -561,12 +596,12 @@ fn render_into(
                 .map(|v| v.meta.id)
                 .filter(|i| *i != master)
                 .collect();
-            draw_master_stack(frame, views, master, &stack, focus, scroll, inline, area);
+            draw_master_stack(frame, views, master, &stack, focus, scroll, inline, area, chrome);
         }
         // Treat the head of the stack as master, the tail as the stack.
         LayoutCmd::Stack(ids) => match ids.split_first() {
             Some((first, rest)) => {
-                draw_master_stack(frame, views, *first, rest, focus, scroll, inline, area)
+                draw_master_stack(frame, views, *first, rest, focus, scroll, inline, area, chrome)
             }
             None => draw_empty(frame, area),
         },
@@ -697,6 +732,7 @@ fn draw_master_stack(
     scroll: u16,
     inline: Option<(&GateView, AgentId)>,
     area: Rect,
+    chrome: Chrome,
 ) {
     let master = find(views, master_id);
     let stack: Vec<&AgentView> = stack_ids.iter().filter_map(|i| find(views, *i)).collect();
@@ -704,7 +740,7 @@ fn draw_master_stack(
     // No side stack (or a single agent): the master fills the whole area.
     if stack.is_empty() {
         match master {
-            Some(m) => draw_pane(frame, m, focus == Some(m.meta.id), scroll, inline, area),
+            Some(m) => draw_pane(frame, m, focus == Some(m.meta.id), scroll, inline, area, chrome),
             None => draw_empty(frame, area),
         }
         return;
@@ -716,10 +752,10 @@ fn draw_master_stack(
         .split(area);
 
     match master {
-        Some(m) => draw_pane(frame, m, focus == Some(m.meta.id), scroll, inline, cols[0]),
+        Some(m) => draw_pane(frame, m, focus == Some(m.meta.id), scroll, inline, cols[0], chrome),
         None => draw_empty(frame, cols[0]),
     }
-    draw_stack(frame, &stack, focus, scroll, inline, cols[1]);
+    draw_stack(frame, &stack, focus, scroll, inline, cols[1], chrome);
 }
 
 /// Show only the given agents, in order, as equal vertical rows (approval
@@ -732,13 +768,14 @@ fn draw_triage(
     scroll: u16,
     inline: Option<(&GateView, AgentId)>,
     area: Rect,
+    chrome: Chrome,
 ) {
     let panes: Vec<&AgentView> = ids.iter().filter_map(|i| find(views, *i)).collect();
     if panes.is_empty() {
         draw_empty(frame, area);
         return;
     }
-    draw_stack(frame, &panes, focus, scroll, inline, area);
+    draw_stack(frame, &panes, focus, scroll, inline, area, chrome);
 }
 
 /// Split `area` into equal vertical rows, one per view.
@@ -749,6 +786,7 @@ fn draw_stack(
     scroll: u16,
     inline: Option<(&GateView, AgentId)>,
     area: Rect,
+    chrome: Chrome,
 ) {
     let n = panes.len() as u32;
     let rows = Layout::default()
@@ -756,7 +794,7 @@ fn draw_stack(
         .constraints(vec![Constraint::Ratio(1, n); panes.len()])
         .split(area);
     for (view, rect) in panes.iter().zip(rows.iter()) {
-        draw_pane(frame, view, focus == Some(view.meta.id), scroll, inline, *rect);
+        draw_pane(frame, view, focus == Some(view.meta.id), scroll, inline, *rect, chrome);
     }
 }
 
@@ -770,6 +808,7 @@ fn draw_pane(
     scroll: u16,
     inline: Option<(&GateView, AgentId)>,
     area: Rect,
+    chrome: Chrome,
 ) {
     // Scroll offset applies only to the focused pane; see the bottom-follow math
     // below. The offset is consumed there.
@@ -786,16 +825,21 @@ fn draw_pane(
     } else {
         Style::default().fg(Color::Gray)
     };
-    let title = if focused {
-        format!("\u{25b8} {}", status_bar(view))
-    } else {
-        status_bar(view)
-    };
+    // Live status indicator (animated spinner + fine activity + turn timer),
+    // colored by activity, sits at the FRONT of the title so it reads at a
+    // glance across every pane; the rest keeps the border style.
+    let focus_marker = if focused { "\u{25b8} " } else { "" };
+    let elapsed_secs = chrome.elapsed.get(&view.meta.id).copied();
+    let (indicator, ind_style) = pane_indicator(view, chrome.tick, elapsed_secs);
+    let title = Line::from(vec![
+        Span::styled(format!("{focus_marker}{indicator}  "), ind_style),
+        Span::styled(status_bar(view), style),
+    ]);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(style)
-        .title(Span::styled(title, style));
+        .title(title);
     let inner_area = block.inner(area);
     frame.render_widget(&block, area);
 
@@ -1309,12 +1353,13 @@ fn status_bar(view: &AgentView) -> String {
         .filter(|m| !m.is_empty())
         .map(|m| format!(" \u{b7} {m}"))
         .unwrap_or_default();
+    // The live state now leads the title via `pane_indicator`; the status bar
+    // keeps identity + tags + token count + mode.
     format!(
-        "{marker}{id} {name} [{tags}] {state} {total}tok{mode}",
+        "{marker}{id} {name} [{tags}] {total}tok{mode}",
         id = view.meta.id,
         name = view.meta.name,
         tags = format_tags(view.meta.tags),
-        state = state_label(view.state),
         total = view.tokens.total(),
     )
 }
@@ -1332,14 +1377,85 @@ fn format_tags(tags: Tags) -> String {
     }
 }
 
-/// A short, stable label for the status bar.
-fn state_label(state: AgentState) -> &'static str {
-    match state {
-        AgentState::Idle => "idle",
-        AgentState::Working => "working",
-        AgentState::BlockedOnApproval => "BLOCKED",
-        AgentState::Done => "done",
-        AgentState::Failed => "failed",
+/// Braille spinner frames for the "working" animation.
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// The spinner glyph for frame `tick`.
+fn spinner(tick: u64) -> char {
+    SPINNER[(tick as usize) % SPINNER.len()]
+}
+
+/// Format a turn timer like ` 8s` / ` 1m05s`; empty when no elapsed is known.
+fn timer(elapsed_secs: Option<u64>) -> String {
+    match elapsed_secs {
+        Some(s) if s >= 60 => format!(" {}m{:02}s", s / 60, s % 60),
+        Some(s) => format!(" {s}s"),
+        None => String::new(),
+    }
+}
+
+/// The tool name from a `⏺ Name(args)` header line (or the whole remainder).
+fn tool_name(header: &str) -> &str {
+    let rest = header.trim_start_matches('⏺').trim_start();
+    rest.split('(').next().unwrap_or(rest).trim()
+}
+
+/// Derive the fine-grained activity of a *working* agent from its transcript
+/// tail: reasoning (`✻`), a tool call (`⏺ Name`), a finished tool (`⎿`), or a
+/// streaming reply (plain text). Continuation lines (diff `  +/-`, wrapped tool
+/// output) are skipped so an edit's diff doesn't mask the tool name. Returns the
+/// label and its color. Display-only heuristic — coarse `Working` is the source
+/// of truth for *whether* it's active.
+fn activity(view: &AgentView) -> (String, Color) {
+    for line in view.tail.iter().rev() {
+        let t = line.text.as_str();
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with('✻') {
+            return ("thinking".to_string(), Color::Cyan);
+        }
+        if t.starts_with('⏺') {
+            return (format!("running {}", tool_name(t)), Color::Yellow);
+        }
+        if t.starts_with('⎿') {
+            // A tool just returned — the agent is processing the result.
+            return ("working".to_string(), Color::Yellow);
+        }
+        if t.starts_with("  ") {
+            continue; // diff / wrapped-output continuation — keep scanning back
+        }
+        if line.kind == LineKind::Text {
+            return ("responding".to_string(), Color::Green);
+        }
+        break;
+    }
+    ("working".to_string(), Color::Yellow)
+}
+
+/// The live status indicator shown at the front of a pane title: an animated
+/// spinner + activity + turn timer while working, or a static state glyph
+/// otherwise. Returns the text and its style.
+fn pane_indicator(view: &AgentView, tick: u64, elapsed_secs: Option<u64>) -> (String, Style) {
+    let bold = Modifier::BOLD;
+    match view.state {
+        AgentState::Idle => ("· idle".to_string(), Style::default().fg(Color::DarkGray)),
+        AgentState::Done => ("✓ done".to_string(), Style::default().fg(Color::Green)),
+        AgentState::Failed => (
+            "✗ failed".to_string(),
+            Style::default().fg(Color::Red).add_modifier(bold),
+        ),
+        AgentState::BlockedOnApproval => (
+            format!("⏸ waiting: approval{}", timer(elapsed_secs)),
+            Style::default().fg(Color::Red).add_modifier(bold),
+        ),
+        AgentState::Working => {
+            let (word, color) = activity(view);
+            (
+                format!("{} {word}{}", spinner(tick), timer(elapsed_secs)),
+                Style::default().fg(color).add_modifier(bold),
+            )
+        }
     }
 }
 
@@ -1477,20 +1593,104 @@ mod tests {
             permission_mode: "plan".into(),
             ..Default::default()
         }));
-        assert_eq!(status_bar(&view), "@0 builder [-] working 120tok \u{b7} plan");
+        assert_eq!(status_bar(&view), "@0 builder [-] 120tok \u{b7} plan");
     }
 
     #[test]
     fn status_bar_omits_mode_when_info_absent() {
-        // With `info: None` the bar is byte-identical to the pre-mode format —
-        // this is what the existing snapshots rely on.
+        // The live state now leads the title via `pane_indicator`, so the bar
+        // itself carries only identity + tags + tokens.
         let view = view_with_info(None);
-        assert_eq!(status_bar(&view), "@0 builder [-] working 120tok");
+        assert_eq!(status_bar(&view), "@0 builder [-] 120tok");
     }
 
     #[test]
     fn status_bar_omits_mode_when_empty() {
         let view = view_with_info(Some(AgentInfo::default()));
-        assert_eq!(status_bar(&view), "@0 builder [-] working 120tok");
+        assert_eq!(status_bar(&view), "@0 builder [-] 120tok");
+    }
+
+    fn view_with_tail(state: AgentState, tail: Vec<TranscriptLine>) -> AgentView {
+        AgentView {
+            meta: AgentMeta {
+                id: AgentId(0),
+                name: "a".into(),
+                tags: Tags::empty(),
+                cwd: "/p".into(),
+                started_at: 0,
+                urgent: false,
+            },
+            state,
+            tokens: TokenUsage::default(),
+            info: None,
+            tail,
+        }
+    }
+
+    #[test]
+    fn spinner_cycles() {
+        assert_eq!(spinner(0), '⠋');
+        assert_eq!(spinner(SPINNER.len() as u64), '⠋');
+        assert_ne!(spinner(1), spinner(0));
+    }
+
+    #[test]
+    fn timer_formats_seconds_and_minutes() {
+        assert_eq!(timer(None), "");
+        assert_eq!(timer(Some(8)), " 8s");
+        assert_eq!(timer(Some(65)), " 1m05s");
+    }
+
+    #[test]
+    fn tool_name_parses_header() {
+        assert_eq!(tool_name("⏺ Bash(ls -la)"), "Bash");
+        assert_eq!(tool_name("⏺ Read"), "Read");
+    }
+
+    #[test]
+    fn activity_distinguishes_thinking_tool_and_reply() {
+        use LineKind as K;
+        let think = view_with_tail(
+            AgentState::Working,
+            vec![TranscriptLine::new(K::Thinking, "✻ pondering")],
+        );
+        assert_eq!(activity(&think).0, "thinking");
+
+        // A tool with its diff after it still reports the tool (scan skips the
+        // `  +/-` diff continuation lines).
+        let edit = view_with_tail(
+            AgentState::Working,
+            vec![
+                TranscriptLine::new(K::ToolCall, "⏺ Edit(src/main.rs)"),
+                TranscriptLine::new(K::ToolError, "  - old"),
+                TranscriptLine::new(K::ToolCall, "  + new"),
+            ],
+        );
+        assert_eq!(activity(&edit).0, "running Edit");
+
+        let reply = view_with_tail(
+            AgentState::Working,
+            vec![TranscriptLine::new(K::Text, "## Summary")],
+        );
+        assert_eq!(activity(&reply).0, "responding");
+
+        assert_eq!(activity(&view_with_tail(AgentState::Working, vec![])).0, "working");
+    }
+
+    #[test]
+    fn pane_indicator_animates_working_and_labels_states() {
+        let working = view_with_tail(
+            AgentState::Working,
+            vec![TranscriptLine::new(LineKind::Thinking, "✻ x")],
+        );
+        assert_eq!(pane_indicator(&working, 0, Some(12)).0, "⠋ thinking 12s");
+
+        assert_eq!(pane_indicator(&view_with_tail(AgentState::Idle, vec![]), 0, None).0, "· idle");
+        assert_eq!(
+            pane_indicator(&view_with_tail(AgentState::BlockedOnApproval, vec![]), 0, Some(3)).0,
+            "⏸ waiting: approval 3s"
+        );
+        let done = view_with_tail(AgentState::Done, vec![]);
+        assert_eq!(pane_indicator(&done, 0, None).0, "✓ done");
     }
 }

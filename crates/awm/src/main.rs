@@ -925,6 +925,11 @@ fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
     let mut show_help = false; // keybinding help overlay (toggled by `?`)
     let mut last_save = Instant::now(); // periodic session autosave
     let mut dirty = false; // a structural change awaiting an immediate save
+    use std::collections::{HashMap, HashSet};
+    let anim = Instant::now(); // spinner clock (wall-time → smooth animation)
+    // Per-agent start of the current active turn, for the status timer. Cleared
+    // when an agent leaves the active (Working/Blocked) states.
+    let mut work_since: HashMap<AgentId, Instant> = HashMap::new();
 
     loop {
         if event::poll(Duration::from_millis(50))? {
@@ -1269,6 +1274,27 @@ fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
 
         let bar = input.as_ref().map(|i| i.bar());
         let picker_view = picker.as_ref().map(|p| p.view());
+
+        // Live status indicator: advance the spinner from wall-clock (~10 fps)
+        // and track how long each agent has been in its current active turn.
+        // The timer resets once an agent leaves the Working/Blocked states.
+        let now = Instant::now();
+        let tick = (anim.elapsed().as_millis() / 100) as u64;
+        let mut elapsed: HashMap<AgentId, u64> = HashMap::new();
+        let mut active: HashSet<AgentId> = HashSet::new();
+        for v in &views {
+            if matches!(
+                v.state,
+                AgentState::Working | AgentState::BlockedOnApproval
+            ) {
+                let since = *work_since.entry(v.meta.id).or_insert(now);
+                elapsed.insert(v.meta.id, now.duration_since(since).as_secs());
+                active.insert(v.meta.id);
+            }
+        }
+        work_since.retain(|id, _| active.contains(id));
+        tui.set_chrome(tick, elapsed);
+
         tui.draw(
             &views,
             &layout,
