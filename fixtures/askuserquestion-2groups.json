@@ -1,0 +1,33 @@
+{
+  "type": "control_request",
+  "request_id": "req-2groups",
+  "request": {
+    "subtype": "can_use_tool",
+    "tool_name": "AskUserQuestion",
+    "display_name": "AskUserQuestion",
+    "tool_use_id": "toolu_2groups",
+    "requires_user_interaction": true,
+    "input": {
+      "questions": [
+        {
+          "question": "Что тестируем. Выберите тип прогона.",
+          "header": "Группа 1",
+          "options": [
+            {"label": "Юнит", "description": "Отдельные функции в изоляции."},
+            {"label": "Интеграционные", "description": "Модули вместе."}
+          ],
+          "multiSelect": false
+        },
+        {
+          "question": "Окружение. Где гоняем.",
+          "header": "Группа 2",
+          "options": [
+            {"label": "Локально", "description": "Твоя машина."},
+            {"label": "CI", "description": "Пайплайн."}
+          ],
+          "multiSelect": false
+        }
+      ]
+    }
+  }
+}

@@ -193,6 +193,8 @@ fn tall_transcript_autoscrolls_to_bottom() {
         false,
         false,
         None,
+        None,
+        None,
         &[],
     )
     .unwrap();
@@ -223,7 +225,7 @@ fn project_tab_bar_marks_active_and_urgent() {
         Tab { name: "web".into(), active: false, urgent: true },
         Tab { name: "docs".into(), active: false, urgent: false },
     ];
-    tui.draw(&views, &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)), None, 0, false, false, None, &tabs)
+    tui.draw(&views, &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)), None, 0, false, false, None, None, None, &tabs)
         .unwrap();
     let out = buffer_to_string(tui.backend());
     let top = out.lines().next().unwrap_or_default();
@@ -239,7 +241,7 @@ fn no_tabs_keeps_layout_unchanged() {
     // pre-projects layout — this is what the other snapshots rely on).
     let mut tui = AwmTui::new(TestBackend::new(40, 8)).unwrap();
     let views = sample_views();
-    tui.draw(&views, &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)), None, 0, false, false, None, &[])
+    tui.draw(&views, &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)), None, 0, false, false, None, None, None, &[])
         .unwrap();
     let out = buffer_to_string(tui.backend());
     let top = out.lines().next().unwrap_or_default();
@@ -250,7 +252,7 @@ fn no_tabs_keeps_layout_unchanged() {
 fn help_overlay_lists_key_sections() {
     let mut tui = AwmTui::new(TestBackend::new(70, 30)).unwrap();
     tui.draw(&sample_views(), &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)),
-             None, 0, false, true, None, &[]).unwrap();
+             None, 0, false, true, None, None, None, &[]).unwrap();
     let out = buffer_to_string(tui.backend());
     for needle in ["keybindings", "Screens", "Ctrl+w", "Ctrl+n", "close active", "quit"] {
         assert!(out.contains(needle), "help overlay missing {needle:?}:\n{out}");
@@ -268,11 +270,147 @@ fn picker_overlay_lists_dirs_and_legend() {
     };
     let mut tui = AwmTui::new(TestBackend::new(70, 14)).unwrap();
     tui.draw(&sample_views(), &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)),
-             None, 0, false, false, Some(&pv), &[]).unwrap();
+             None, 0, false, false, Some(&pv), None, None, &[]).unwrap();
     let out = buffer_to_string(tui.backend());
     assert!(out.contains("prototupe"), "title path:\n{out}");
     assert!(out.contains("find: cr"), "active filter shown in title:\n{out}");
     assert!(out.contains("crates/"), "a matching subdir:\n{out}");
     assert!(out.contains("../"), "parent entry:\n{out}");
     assert!(out.contains("Tab select"), "footer legend:\n{out}");
+}
+
+#[test]
+fn gate_overlay_renders_plan_and_single_select() {
+    use awm_tui::{GateGroup, GateOption, GateView};
+    let gv = GateView {
+        title: "ExitPlanMode".into(),
+        body: vec![
+            tl(LineKind::Text, "## Plan: port the gate"),
+            tl(LineKind::Text, "1. Add a GateView overlay"),
+        ],
+        groups: vec![GateGroup {
+            header: String::new(),
+            prompt: String::new(),
+            options: vec![
+                GateOption::new("Yes, proceed"),
+                GateOption::new("No, keep planning"),
+            ],
+            selected: 0,
+            multi: false,
+        }],
+        cursor_group: 0,
+        cursor_opt: 0,
+    };
+    let mut tui = AwmTui::new(TestBackend::new(60, 12)).unwrap();
+    tui.draw(&sample_views(), &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)),
+             None, 0, false, false, None, Some(&gv), None, &[]).unwrap();
+    let out = buffer_to_string(tui.backend());
+    assert!(out.contains("ExitPlanMode"), "gate title:\n{out}");
+    assert!(out.contains("Plan: port the gate"), "markdown body:\n{out}");
+    assert!(out.contains("❯"), "cursor present:\n{out}");
+    assert!(out.contains("(●) Yes, proceed"), "radio pick on the first option:\n{out}");
+    assert!(out.contains("No, keep planning"), "second option:\n{out}");
+    assert!(out.contains("Enter send"), "single-select legend:\n{out}");
+}
+
+#[test]
+fn gate_inline_renders_menu_inside_the_pane() {
+    use awm_tui::{GateGroup, GateOption, GateView};
+    let gv = GateView {
+        title: "AskUserQuestion".into(),
+        body: vec![],
+        groups: vec![GateGroup {
+            header: "Indentation".into(),
+            prompt: "Do you prefer TABS or SPACES?".into(),
+            options: vec![GateOption::new("Tabs"), GateOption::new("Spaces")],
+            selected: 1, // radio pick = 2nd option
+            multi: false,
+        }],
+        cursor_group: 0,
+        cursor_opt: 1, // cursor on the 2nd option
+    };
+    let views = sample_views();
+    let id = views[0].meta.id;
+    let mut tui = AwmTui::new(TestBackend::new(72, 16)).unwrap();
+    // gate + gate_target set → the menu renders INLINE in that agent's pane
+    // (not as a full-screen overlay).
+    tui.draw(&views, &LayoutCmd::Monocle(id), Some(id),
+             None, 0, false, false, None, Some(&gv), Some(id), &[]).unwrap();
+    let out = buffer_to_string(tui.backend());
+    assert!(out.contains("Do you prefer TABS or SPACES?"), "question inline:\n{out}");
+    assert!(out.contains("Tabs"), "first option:\n{out}");
+    assert!(out.contains("❯"), "cursor present:\n{out}");
+    assert!(out.contains("(●) Spaces"), "radio pick on the 2nd option:\n{out}");
+    assert!(out.contains("Enter send"), "inline key hint:\n{out}");
+    // Inline, not a takeover: the pane border/status bar is still there.
+    assert!(out.contains("│"), "pane frame remains around the menu:\n{out}");
+}
+
+#[test]
+fn gate_inline_renders_two_question_groups() {
+    use awm_tui::{GateGroup, GateOption, GateView};
+    let gv = GateView {
+        title: "AskUserQuestion".into(),
+        body: vec![],
+        groups: vec![
+            GateGroup {
+                header: "Group 1".into(),
+                prompt: "What to test?".into(),
+                options: vec![GateOption::new("Unit"), GateOption::new("Integration")],
+                selected: 0,
+                multi: false,
+            },
+            GateGroup {
+                header: "Group 2".into(),
+                prompt: "Where?".into(),
+                options: vec![GateOption::new("Local"), GateOption::new("CI")],
+                selected: 0,
+                multi: false,
+            },
+        ],
+        cursor_group: 1, // cursor in the 2nd group
+        cursor_opt: 1,
+    };
+    let views = sample_views();
+    let id = views[0].meta.id;
+    let mut tui = AwmTui::new(TestBackend::new(72, 20)).unwrap();
+    tui.draw(&views, &LayoutCmd::Monocle(id), Some(id),
+             None, 0, false, false, None, Some(&gv), Some(id), &[]).unwrap();
+    let out = buffer_to_string(tui.backend());
+    // BOTH groups render (headers + options) — the multi-question fix.
+    assert!(out.contains("Group 1") && out.contains("Group 2"), "both headers:\n{out}");
+    assert!(out.contains("Unit") && out.contains("Integration"), "group 1 options:\n{out}");
+    assert!(out.contains("Local") && out.contains("CI"), "group 2 options:\n{out}");
+    assert!(out.contains("❯"), "cursor present:\n{out}");
+}
+
+#[test]
+fn gate_overlay_multi_select_shows_checkboxes() {
+    use awm_tui::{GateGroup, GateOption, GateView};
+    let mut opts = vec![
+        GateOption::new("cargo build"),
+        GateOption::new("cargo test"),
+        GateOption::new("snapshot review"),
+    ];
+    opts[1].checked = true; // a pre-checked option renders `[x]`
+    let gv = GateView {
+        title: "Which checks to run?".into(),
+        body: vec![],
+        groups: vec![GateGroup {
+            header: String::new(),
+            prompt: String::new(),
+            options: opts,
+            selected: 0,
+            multi: true,
+        }],
+        cursor_group: 0,
+        cursor_opt: 0,
+    };
+    let mut tui = AwmTui::new(TestBackend::new(60, 8)).unwrap();
+    tui.draw(&sample_views(), &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)),
+             None, 0, false, false, None, Some(&gv), None, &[]).unwrap();
+    let out = buffer_to_string(tui.backend());
+    assert!(out.contains("[ ] cargo build"), "unchecked box:\n{out}");
+    assert!(out.contains("[x] cargo test"), "checked box:\n{out}");
+    assert!(out.contains("Space toggle"), "multi-select legend:\n{out}");
 }

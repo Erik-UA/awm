@@ -196,10 +196,18 @@ fn push_line(ring: &Arc<Mutex<VecDeque<String>>>, line: &mut Vec<u8>, cap: usize
 }
 
 /// A permission decision for a pending `can_use_tool` control_request.
+///
+/// This is the *intent* (approve / deny). The concrete `updatedInput` echoed on
+/// an allow is supplied separately by the caller (see [`Answerer::answer`]) — it
+/// is normally the tool's original input, which the controller must preserve.
 #[derive(Clone, Debug)]
 pub enum Decision {
-    /// Approve; optionally pass through updated input (usually the original).
+    /// Approve, running the tool with an empty `updatedInput`.
     Allow,
+    /// Approve, echoing a caller-built `updatedInput` — an already-serialized JSON
+    /// object (e.g. an `AskUserQuestion` selection, or a plan's edited input). The
+    /// caller owns serialization so this crate stays serde-free.
+    AllowWith(String),
     /// Reject with a human-readable reason.
     Deny(String),
 }
@@ -330,6 +338,10 @@ impl Answerer {
     pub fn answer(&self, request_id: &str, decision: Decision) -> std::io::Result<()> {
         let inner = match decision {
             Decision::Allow => r#"{"behavior":"allow","updatedInput":{}}"#.to_string(),
+            // `updated_input` is already a serialized JSON object — inline it.
+            Decision::AllowWith(updated_input) => {
+                format!(r#"{{"behavior":"allow","updatedInput":{updated_input}}}"#)
+            }
             Decision::Deny(reason) => {
                 format!(r#"{{"behavior":"deny","message":"{}"}}"#, json_escape(&reason))
             }

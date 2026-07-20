@@ -45,6 +45,122 @@ pub struct PickerView {
     pub query: String,
 }
 
+/// One selectable option in a [`GateView`]. `checked` only matters for
+/// multi-select gates; single-select ignores it and reports [`GateView::selected`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GateOption {
+    pub label: String,
+    pub checked: bool,
+}
+
+impl GateOption {
+    #[must_use]
+    pub fn new(label: impl Into<String>) -> Self {
+        GateOption { label: label.into(), checked: false }
+    }
+}
+
+/// One question group in a [`GateView`]: a header/prompt over a set of options.
+/// `AskUserQuestion` maps each of its questions to a group; plain gates use a
+/// single group. Not `Eq` (owns owned strings only — but kept `PartialEq`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GateGroup {
+    /// Short header (AskUserQuestion `header`; empty for plan/tool gates).
+    pub header: String,
+    /// The question / prompt text shown above the options.
+    pub prompt: String,
+    /// The choices, in display order.
+    pub options: Vec<GateOption>,
+    /// The chosen row for a single-select group (radio pick); ignored when `multi`.
+    pub selected: usize,
+    /// Multi-select (checkboxes) vs single-select (radio).
+    pub multi: bool,
+}
+
+/// An interactive decision overlay: an optional markdown `body` (e.g. an
+/// `ExitPlanMode` plan) above one or more keyboard-navigable question `groups`.
+/// Built by the binary from an `ApprovalCtx`; kept here (not in the frozen
+/// `awm-proto`) like [`PickerView`] and [`Tab`]. Mirrors Claude Code's approval /
+/// plan prompt and the multi-question `AskUserQuestion` widget.
+///
+/// A flat cursor `(cursor_group, cursor_opt)` walks across all groups; `Space`
+/// picks a radio / toggles a checkbox; `Enter` submits every group.
+///
+/// Not `Eq` because `TranscriptLine` (in the frozen `awm-proto`) is only
+/// `PartialEq`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GateView {
+    /// Panel title (e.g. the tool name, or `"Ready to code?"`).
+    pub title: String,
+    /// Markdown body shown above the groups (empty = an options-only gate).
+    pub body: Vec<TranscriptLine>,
+    /// One or more question groups (≥1; plain gates use a single Yes/No group).
+    pub groups: Vec<GateGroup>,
+    /// The active group + option under the cursor.
+    pub cursor_group: usize,
+    pub cursor_opt: usize,
+}
+
+impl GateView {
+    /// Move the flat cursor by `delta` across the concatenation of every group's
+    /// options (crossing group boundaries), clamped (no wrap-around).
+    pub fn move_cursor(&mut self, delta: isize) {
+        // Flatten to a global index, shift, clamp, then map back to (group, opt).
+        let flat: Vec<(usize, usize)> = self
+            .groups
+            .iter()
+            .enumerate()
+            .flat_map(|(gi, g)| (0..g.options.len()).map(move |oi| (gi, oi)))
+            .collect();
+        if flat.is_empty() {
+            return;
+        }
+        let cur = flat
+            .iter()
+            .position(|&(gi, oi)| gi == self.cursor_group && oi == self.cursor_opt)
+            .unwrap_or(0) as isize;
+        let next = (cur + delta).clamp(0, flat.len() as isize - 1) as usize;
+        let (gi, oi) = flat[next];
+        self.cursor_group = gi;
+        self.cursor_opt = oi;
+    }
+
+    /// Pick/toggle the option under the cursor: multi-select flips its `checked`
+    /// flag; single-select sets the group's `selected` (radio).
+    pub fn toggle(&mut self) {
+        if let Some(g) = self.groups.get_mut(self.cursor_group) {
+            if g.multi {
+                if let Some(o) = g.options.get_mut(self.cursor_opt) {
+                    o.checked = !o.checked;
+                }
+            } else {
+                g.selected = self.cursor_opt;
+            }
+        }
+    }
+
+    /// The chosen option indices per group, submitted on Enter: single-select →
+    /// `[selected]`, multi-select → every checked option.
+    #[must_use]
+    pub fn chosen(&self) -> Vec<Vec<usize>> {
+        self.groups
+            .iter()
+            .map(|g| {
+                if g.multi {
+                    g.options
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, o)| o.checked)
+                        .map(|(i, _)| i)
+                        .collect()
+                } else {
+                    vec![g.selected]
+                }
+            })
+            .collect()
+    }
+}
+
 /// The TUI renderer, generic over a ratatui backend.
 pub struct AwmTui<B: Backend> {
     terminal: Terminal<B>,
@@ -83,6 +199,8 @@ impl<B: Backend> AwmTui<B> {
         show_card: bool,
         show_help: bool,
         picker: Option<&PickerView>,
+        gate: Option<&GateView>,
+        gate_target: Option<AgentId>,
         tabs: &[Tab],
     ) -> std::io::Result<()> {
         self.terminal.draw(|frame| {
@@ -116,6 +234,13 @@ impl<B: Backend> AwmTui<B> {
                 render_picker(frame, pv, area);
                 return;
             }
+            // A demo gate (`g`/`G`, no live target) takes over the body as a
+            // full-screen overlay. A LIVE gate (`gate_target` set) instead renders
+            // inline at the bottom of its agent's pane — see `render_into`.
+            if let (Some(gv), None) = (gate, gate_target) {
+                render_gate(frame, gv, area);
+                return;
+            }
             // The help overlay takes over the whole body.
             if show_help {
                 render_help(frame, area);
@@ -128,7 +253,12 @@ impl<B: Backend> AwmTui<B> {
                     return;
                 }
             }
-            render_into(frame, views, layout, focus, scroll, area);
+            // A live gate belongs to a specific agent's pane (inline menu).
+            let inline = match (gate, gate_target) {
+                (Some(g), Some(t)) => Some((g, t)),
+                _ => None,
+            };
+            render_into(frame, views, layout, focus, scroll, inline, area);
         })?;
         Ok(())
     }
@@ -136,7 +266,7 @@ impl<B: Backend> AwmTui<B> {
 
 impl<B: Backend> Renderer for AwmTui<B> {
     fn render(&mut self, views: &[AgentView], layout: &LayoutCmd) -> std::io::Result<()> {
-        self.draw(views, layout, None, None, 0, false, false, None, &[])
+        self.draw(views, layout, None, None, 0, false, false, None, None, None, &[])
     }
 }
 
@@ -188,6 +318,108 @@ fn render_picker(frame: &mut Frame, view: &PickerView, area: Rect) {
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Render every question group to styled lines, marking the option under the
+/// flat cursor with `❯`. Single-select shows a `(●)`/`( )` radio; multi-select
+/// shows `[x]`/`[ ]`. Returns the lines plus the cursor row's line index (so an
+/// inline footer can scroll to keep it visible). A blank line separates groups.
+fn gate_group_lines(view: &GateView) -> (Vec<Line<'static>>, usize) {
+    let hdr = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut cursor_line = 0usize;
+    for (gi, g) in view.groups.iter().enumerate() {
+        if gi > 0 {
+            out.push(Line::from(String::new())); // gap between groups
+        }
+        if !g.header.is_empty() {
+            out.push(Line::from(Span::styled(g.header.clone(), hdr)));
+        }
+        if !g.prompt.is_empty() {
+            out.push(Line::from(Span::styled(
+                g.prompt.clone(),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        for (oi, opt) in g.options.iter().enumerate() {
+            let at_cursor = gi == view.cursor_group && oi == view.cursor_opt;
+            if at_cursor {
+                cursor_line = out.len();
+            }
+            let cur = if at_cursor { "\u{276f} " } else { "  " };
+            let mark = if g.multi {
+                if opt.checked { "[x] " } else { "[ ] " }
+            } else if g.selected == oi {
+                "(\u{25cf}) " // filled radio = the picked option
+            } else {
+                "( ) "
+            };
+            let style = if at_cursor {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            out.push(Line::from(Span::styled(
+                format!("{cur}{mark}{}", opt.label),
+                style,
+            )));
+        }
+    }
+    (out, cursor_line)
+}
+
+/// The key hint shown under a gate. `cancel` picks the closing verb
+/// (overlay = "cancel", inline = "hide").
+fn gate_hint(view: &GateView, cancel: &str) -> String {
+    let multi = view.groups.iter().any(|g| g.multi);
+    let pick = if multi { "Space toggle" } else { "Space pick" };
+    format!("\u{2191}\u{2193} move \u{b7} {pick} \u{b7} Enter send \u{b7} Esc {cancel}")
+}
+
+/// The interactive decision overlay (approval gate / `ExitPlanMode` plan): a
+/// bordered panel with an optional markdown body over the question group(s) and a
+/// key legend. Mirrors `render_picker`'s look. (Used by the `g`/`G`-style demo
+/// snapshots; live gates render inline — see `gate_inline_lines`.)
+fn render_gate(frame: &mut Frame, view: &GateView, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", view.title));
+    frame.render_widget(&block, area);
+    let inner = block.inner(area);
+    if inner.height == 0 {
+        return;
+    }
+    let width = inner.width as usize;
+
+    let (group_lines, _) = gate_group_lines(view);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),                          // markdown body
+            Constraint::Length(group_lines.len() as u16), // groups
+            Constraint::Length(1),                       // legend
+        ])
+        .split(inner);
+
+    if !view.body.is_empty() && rows[0].height > 0 {
+        let mut body: Vec<Line> = Vec::new();
+        for tl in &view.body {
+            body.extend(render_transcript_line(tl, width));
+        }
+        body.truncate(rows[0].height as usize);
+        frame.render_widget(Paragraph::new(body), rows[0]);
+    }
+
+    frame.render_widget(Paragraph::new(group_lines), rows[1]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            gate_hint(view, "cancel"),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[2],
+    );
 }
 
 /// Left-elide a path to at most `w` columns, prefixing `…` when truncated.
@@ -258,8 +490,10 @@ fn render_help(frame: &mut Frame, area: Rect) {
         &mut body,
         "Approvals & app",
         &[
-            ("y / n", "approve / deny the blocked agent"),
-            ("e", "expand the blocked agent to answer"),
+            ("↑↓ / Space", "move / toggle in the inline decision menu"),
+            ("Enter", "send the menu choice to the agent"),
+            ("y / n", "approve / deny (oldest blocked agent)"),
+            ("e / Esc", "reopen / hide the inline decision menu"),
             ("?", "toggle this help"),
             ("q", "quit (saves the session)"),
         ],
@@ -309,14 +543,15 @@ fn render_into(
     layout: &LayoutCmd,
     focus: Option<AgentId>,
     scroll: u16,
+    inline: Option<(&GateView, AgentId)>,
     area: Rect,
 ) {
     match layout {
         LayoutCmd::Monocle(id) => match find(views, *id) {
-            Some(v) => draw_pane(frame, v, focus == Some(v.meta.id), scroll, area),
+            Some(v) => draw_pane(frame, v, focus == Some(v.meta.id), scroll, inline, area),
             None => draw_empty(frame, area),
         },
-        LayoutCmd::Triage(ids) => draw_triage(frame, views, ids, focus, scroll, area),
+        LayoutCmd::Triage(ids) => draw_triage(frame, views, ids, focus, scroll, inline, area),
         // Both promote a single agent to the master zone; the rest of the roster
         // falls into the side stack in roster order.
         LayoutCmd::SetMaster(id) | LayoutCmd::Focus(id) => {
@@ -326,12 +561,12 @@ fn render_into(
                 .map(|v| v.meta.id)
                 .filter(|i| *i != master)
                 .collect();
-            draw_master_stack(frame, views, master, &stack, focus, scroll, area);
+            draw_master_stack(frame, views, master, &stack, focus, scroll, inline, area);
         }
         // Treat the head of the stack as master, the tail as the stack.
         LayoutCmd::Stack(ids) => match ids.split_first() {
             Some((first, rest)) => {
-                draw_master_stack(frame, views, *first, rest, focus, scroll, area)
+                draw_master_stack(frame, views, *first, rest, focus, scroll, inline, area)
             }
             None => draw_empty(frame, area),
         },
@@ -460,6 +695,7 @@ fn draw_master_stack(
     stack_ids: &[AgentId],
     focus: Option<AgentId>,
     scroll: u16,
+    inline: Option<(&GateView, AgentId)>,
     area: Rect,
 ) {
     let master = find(views, master_id);
@@ -468,7 +704,7 @@ fn draw_master_stack(
     // No side stack (or a single agent): the master fills the whole area.
     if stack.is_empty() {
         match master {
-            Some(m) => draw_pane(frame, m, focus == Some(m.meta.id), scroll, area),
+            Some(m) => draw_pane(frame, m, focus == Some(m.meta.id), scroll, inline, area),
             None => draw_empty(frame, area),
         }
         return;
@@ -480,10 +716,10 @@ fn draw_master_stack(
         .split(area);
 
     match master {
-        Some(m) => draw_pane(frame, m, focus == Some(m.meta.id), scroll, cols[0]),
+        Some(m) => draw_pane(frame, m, focus == Some(m.meta.id), scroll, inline, cols[0]),
         None => draw_empty(frame, cols[0]),
     }
-    draw_stack(frame, &stack, focus, scroll, cols[1]);
+    draw_stack(frame, &stack, focus, scroll, inline, cols[1]);
 }
 
 /// Show only the given agents, in order, as equal vertical rows (approval
@@ -494,6 +730,7 @@ fn draw_triage(
     ids: &[AgentId],
     focus: Option<AgentId>,
     scroll: u16,
+    inline: Option<(&GateView, AgentId)>,
     area: Rect,
 ) {
     let panes: Vec<&AgentView> = ids.iter().filter_map(|i| find(views, *i)).collect();
@@ -501,7 +738,7 @@ fn draw_triage(
         draw_empty(frame, area);
         return;
     }
-    draw_stack(frame, &panes, focus, scroll, area);
+    draw_stack(frame, &panes, focus, scroll, inline, area);
 }
 
 /// Split `area` into equal vertical rows, one per view.
@@ -510,6 +747,7 @@ fn draw_stack(
     panes: &[&AgentView],
     focus: Option<AgentId>,
     scroll: u16,
+    inline: Option<(&GateView, AgentId)>,
     area: Rect,
 ) {
     let n = panes.len() as u32;
@@ -518,14 +756,21 @@ fn draw_stack(
         .constraints(vec![Constraint::Ratio(1, n); panes.len()])
         .split(area);
     for (view, rect) in panes.iter().zip(rows.iter()) {
-        draw_pane(frame, view, focus == Some(view.meta.id), scroll, *rect);
+        draw_pane(frame, view, focus == Some(view.meta.id), scroll, inline, *rect);
     }
 }
 
 /// Draw one agent pane: a bordered block titled with its status bar, body is the
 /// PTY tail. Urgent agents get a red, bold, `!`-marked frame so they stand out
 /// even in a style-blind (symbol-only) snapshot.
-fn draw_pane(frame: &mut Frame, view: &AgentView, focused: bool, scroll: u16, area: Rect) {
+fn draw_pane(
+    frame: &mut Frame,
+    view: &AgentView,
+    focused: bool,
+    scroll: u16,
+    inline: Option<(&GateView, AgentId)>,
+    area: Rect,
+) {
     // Scroll offset applies only to the focused pane; see the bottom-follow math
     // below. The offset is consumed there.
     let urgent = view.is_urgent();
@@ -551,9 +796,36 @@ fn draw_pane(frame: &mut Frame, view: &AgentView, focused: bool, scroll: u16, ar
         .borders(Borders::ALL)
         .border_style(style)
         .title(Span::styled(title, style));
+    let inner_area = block.inner(area);
+    frame.render_widget(&block, area);
 
-    let inner = area.width.saturating_sub(2) as usize; // width inside the border
-    let visible = area.height.saturating_sub(2) as usize; // rows inside the border
+    // A live gate for THIS pane renders as an inline menu pinned to the bottom
+    // (Claude-style): reserve its rows, the transcript takes what's left above.
+    let gate = inline.and_then(|(g, t)| (view.meta.id == t).then_some(g));
+    let (body_area, gate_area) = match gate {
+        Some(g) => {
+            let body_h: usize = g
+                .body
+                .iter()
+                .map(|tl| tl.text.lines().count().max(1))
+                .sum();
+            let (group_lines, _) = gate_group_lines(g);
+            // separator + plan body + every group's lines + hint. Cap so at least
+            // one transcript row remains; `gate_inline_lines` windows to fit.
+            let want = 1 + body_h + group_lines.len() + 1;
+            let cap = (inner_area.height as usize).saturating_sub(1).max(1);
+            let gate_h = want.min(cap);
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(gate_h as u16)])
+                .split(inner_area);
+            (rows[0], Some(rows[1]))
+        }
+        None => (inner_area, None),
+    };
+
+    let inner = inner_area.width as usize; // width inside the border
+    let visible = body_area.height as usize; // transcript rows
     let body: Vec<Line> = view
         .tail
         .iter()
@@ -570,7 +842,50 @@ fn draw_pane(frame: &mut Frame, view: &AgentView, focused: bool, scroll: u16, ar
     let y = max_off
         .saturating_sub(scroll_off)
         .min(u16::MAX as usize) as u16;
-    frame.render_widget(Paragraph::new(body).block(block).scroll((y, 0)), area);
+    frame.render_widget(Paragraph::new(body).scroll((y, 0)), body_area);
+
+    if let (Some(g), Some(ga)) = (gate, gate_area) {
+        let lines = gate_inline_lines(g, inner, ga.height as usize);
+        frame.render_widget(Paragraph::new(lines), ga);
+    }
+}
+
+/// The live decision menu rendered INLINE at the bottom of a pane (Claude-style):
+/// a separator, the plan body (if any), every question group, and a key hint.
+/// When the content is taller than `max_h`, a window of rows is shown scrolled so
+/// the cursor row stays visible (the hint is always pinned last).
+fn gate_inline_lines(gate: &GateView, width: usize, max_h: usize) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let (group_lines, cursor_in_groups) = gate_group_lines(gate);
+    let body: Vec<Line<'static>> = gate
+        .body
+        .iter()
+        .flat_map(|tl| render_transcript_line(tl, width))
+        .collect();
+
+    // content = separator + plan body + group lines. Track the cursor's index.
+    let mut content: Vec<Line<'static>> = Vec::with_capacity(1 + body.len() + group_lines.len());
+    content.push(Line::from(Span::styled("\u{2500}".repeat(width.min(48)), dim)));
+    content.extend(body);
+    let groups_start = content.len();
+    content.extend(group_lines);
+    let cursor_abs = groups_start + cursor_in_groups;
+
+    let hint = Line::from(Span::styled(gate_hint(gate, "hide"), dim));
+
+    // Reserve the last row for the hint; window the rest around the cursor.
+    let avail = max_h.saturating_sub(1).max(1);
+    let mut out: Vec<Line<'static>> = if content.len() <= avail {
+        content
+    } else {
+        let start = cursor_abs
+            .saturating_sub(avail / 2)
+            .min(content.len() - avail);
+        content.into_iter().skip(start).take(avail).collect()
+    };
+    out.push(hint);
+    out
 }
 
 /// Whether this pane is a spawned sub-agent. The frozen `AgentView` carries no
@@ -1118,6 +1433,8 @@ mod tests {
             true,
             false,
             None,
+            None,
+            None,
             &[],
         )
         .unwrap();
@@ -1137,6 +1454,8 @@ mod tests {
             0,
             true,
             false,
+            None,
+            None,
             None,
             &[],
         )

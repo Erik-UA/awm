@@ -356,7 +356,7 @@ impl Engine {
         } else {
             self.parent_of.get(&id).copied().unwrap_or(id)
         };
-        let approved = matches!(decision, Decision::Allow);
+        let approved = matches!(decision, Decision::Allow | Decision::AllowWith(_));
         if let Some(answerer) = self.answerers.get(&proc) {
             answerer.answer(&request_id, decision)?;
         }
