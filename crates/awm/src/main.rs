@@ -18,7 +18,9 @@ use awm_proto::{AgentId, AgentState, LineKind, Renderer, Tags, TranscriptLine};
 use awm_tui::keymap::{map_key, Action};
 use awm_tui::AwmTui;
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -227,6 +229,9 @@ fn list_subdirs(dir: &std::path::Path) -> Vec<PathBuf> {
 
 /// Lines scrolled per PgUp/PgDn.
 const SCROLL_STEP: u16 = 8;
+
+/// Lines scrolled per mouse-wheel notch (gentler than a PgUp page).
+const MOUSE_SCROLL_STEP: u16 = 3;
 
 /// The next permission mode in the Shift+Tab cycle (bypassPermissions excluded).
 fn next_mode(current: &str) -> &'static str {
@@ -923,7 +928,19 @@ fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
 
     loop {
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
+            let ev = event::read()?;
+            if let Event::Mouse(me) = &ev {
+                // Mouse-wheel scrolls the active pane's history via the same
+                // `scroll` offset PgUp/PgDn drive (0 = follow newest). Clamped
+                // to the focused pane's content by the per-frame bound below.
+                match me.kind {
+                    MouseEventKind::ScrollUp => scroll = scroll.saturating_add(MOUSE_SCROLL_STEP),
+                    MouseEventKind::ScrollDown => {
+                        scroll = scroll.saturating_sub(MOUSE_SCROLL_STEP)
+                    }
+                    _ => {}
+                }
+            } else if let Event::Key(key) = ev {
                 if let Some(p) = picker.as_mut() {
                     // Directory-browser mode (Ctrl+n). Typing filters the list by
                     // prefix; ↑↓ move, → open, ← up, Enter selects the highlighted
@@ -1530,7 +1547,7 @@ struct TermGuard;
 impl TermGuard {
     fn enter() -> std::io::Result<Self> {
         enable_raw_mode()?;
-        crossterm::execute!(stdout(), EnterAlternateScreen)?;
+        crossterm::execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         Ok(TermGuard)
     }
 }
@@ -1538,7 +1555,7 @@ impl TermGuard {
 impl Drop for TermGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = crossterm::execute!(stdout(), LeaveAlternateScreen);
+        let _ = crossterm::execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
