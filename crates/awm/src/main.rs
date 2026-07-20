@@ -71,22 +71,19 @@ impl Input {
 struct Picker {
     /// The directory currently being browsed.
     cwd: PathBuf,
-    /// Its subdirectories, sorted (case-insensitive).
+    /// ALL subdirectories of `cwd`, sorted (case-insensitive) — unfiltered.
     dirs: Vec<PathBuf>,
-    /// Highlighted row: 0 = `../` (unless at filesystem root), else `dirs[sel-1]`.
+    /// Prefix filter typed by the user (case-insensitive; empty = show all).
+    query: String,
+    /// Highlighted row over the *filtered* rows: 0 = `../` (unless at root),
+    /// else the (`sel`-1)-th match.
     sel: usize,
 }
 
 impl Picker {
     fn open(start: PathBuf) -> Self {
-        let mut p = Picker { cwd: start, dirs: Vec::new(), sel: 0 };
-        p.refresh();
-        p
-    }
-
-    fn refresh(&mut self) {
-        self.dirs = list_subdirs(&self.cwd);
-        self.sel = 0;
+        let dirs = list_subdirs(&start);
+        Picker { cwd: start, dirs, query: String::new(), sel: 0 }
     }
 
     /// Whether row 0 is the `../` entry (present unless we're at the root).
@@ -94,9 +91,22 @@ impl Picker {
         self.cwd.parent().is_some()
     }
 
-    /// Total rows (optional `../` + subdirs).
+    /// Subdirectories whose name starts with the (lowercased) query.
+    fn matches(&self) -> Vec<&PathBuf> {
+        let q = self.query.to_lowercase();
+        self.dirs
+            .iter()
+            .filter(|d| {
+                d.file_name()
+                    .map(|s| s.to_string_lossy().to_lowercase().starts_with(&q))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// Visible rows: optional `../` + filtered matches.
     fn rows(&self) -> usize {
-        self.dirs.len() + usize::from(self.has_parent())
+        self.matches().len() + usize::from(self.has_parent())
     }
 
     fn move_sel(&mut self, delta: isize) {
@@ -107,36 +117,80 @@ impl Picker {
         self.sel = (((self.sel as isize + delta) % n + n) % n) as usize;
     }
 
-    /// The subdirectory a given row points at, if any (accounting for `../`).
-    fn dir_at(&self, row: usize) -> Option<&PathBuf> {
-        let base = usize::from(self.has_parent());
-        self.dirs.get(row.checked_sub(base)?)
+    /// Whether the `../` row is highlighted.
+    fn on_parent_row(&self) -> bool {
+        self.has_parent() && self.sel == 0
     }
 
-    /// Enter: descend into the highlighted subdir, or go up on `../`.
-    fn enter(&mut self) {
-        if self.has_parent() && self.sel == 0 {
-            self.parent();
-        } else if let Some(d) = self.dir_at(self.sel).cloned() {
-            self.cwd = d;
-            self.refresh();
+    /// The subdirectory the highlighted row points at (None on `../`).
+    fn selected_dir(&self) -> Option<PathBuf> {
+        let base = usize::from(self.has_parent());
+        self.matches()
+            .get(self.sel.checked_sub(base)?)
+            .map(|p| (*p).clone())
+    }
+
+    /// Move the highlight to the first match after the query changed.
+    fn snap_to_first_match(&mut self) {
+        self.sel = if self.matches().is_empty() {
+            0
+        } else {
+            usize::from(self.has_parent()) // first match row (after `../`)
+        };
+    }
+
+    fn push_query(&mut self, c: char) {
+        self.query.push(c);
+        self.snap_to_first_match();
+    }
+
+    /// Delete one query char; returns false if the query was already empty.
+    fn pop_query(&mut self) -> bool {
+        if self.query.pop().is_some() {
+            self.snap_to_first_match();
+            true
+        } else {
+            false
         }
     }
 
+    fn clear_query(&mut self) {
+        self.query.clear();
+        self.snap_to_first_match();
+    }
+
+    /// Descend into the highlighted subdirectory (no-op on `../`).
+    fn descend(&mut self) {
+        if let Some(d) = self.selected_dir() {
+            self.cwd = d;
+            self.query.clear();
+            self.dirs = list_subdirs(&self.cwd);
+            self.sel = 0;
+        }
+    }
+
+    /// Go up one level, landing the highlight on the folder we came FROM (so a
+    /// back-step keeps your place instead of resetting to the top).
     fn parent(&mut self) {
         if let Some(p) = self.cwd.parent() {
+            let from = self.cwd.clone();
             self.cwd = p.to_path_buf();
-            self.refresh();
+            self.query.clear();
+            self.dirs = list_subdirs(&self.cwd);
+            self.sel = match self.dirs.iter().position(|d| *d == from) {
+                Some(i) => i + usize::from(self.has_parent()),
+                None => 0,
+            };
         }
     }
 
-    /// Render DTO for the TUI overlay.
+    /// Render DTO for the TUI overlay (entries reflect the active filter).
     fn view(&self) -> awm_tui::PickerView {
         let mut entries: Vec<String> = Vec::new();
         if self.has_parent() {
             entries.push("../".into());
         }
-        for d in &self.dirs {
+        for d in self.matches() {
             let name = d
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -147,6 +201,7 @@ impl Picker {
             path: self.cwd.display().to_string(),
             entries,
             selected: self.sel,
+            query: self.query.clone(),
         }
     }
 }
@@ -678,26 +733,52 @@ fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if let Some(p) = picker.as_mut() {
-                    // Directory-browser mode (Ctrl+n): navigate, `s` selects the
-                    // current folder as a new project, Esc cancels.
+                    // Directory-browser mode (Ctrl+n). Typing filters the list by
+                    // prefix; ↑↓ move, → open, ← up, Enter selects the highlighted
+                    // folder as a new project, Esc clears the filter (else cancels).
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                     match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => p.move_sel(-1),
-                        KeyCode::Down | KeyCode::Char('j') => p.move_sel(1),
-                        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => p.enter(),
-                        KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => p.parent(),
-                        KeyCode::Char('s') | KeyCode::Char(' ') => {
-                            let cwd = p.cwd.clone();
-                            let name = cwd
+                        KeyCode::Up => p.move_sel(-1),
+                        KeyCode::Down => p.move_sel(1),
+                        // Enter / → navigate INTO the highlighted folder (or up on
+                        // `../`). Selecting a folder as a project is a separate key.
+                        KeyCode::Enter | KeyCode::Right => {
+                            if p.on_parent_row() {
+                                p.parent();
+                            } else {
+                                p.descend();
+                            }
+                        }
+                        KeyCode::Left => p.parent(),
+                        // Tab SELECTS the folder as a new project: the highlighted
+                        // subfolder, or the current directory when `../` is
+                        // highlighted. (Letters type into the filter, so select
+                        // can't be a letter key like the old `s`.)
+                        KeyCode::Tab => {
+                            let dir = p.selected_dir().unwrap_or_else(|| p.cwd.clone());
+                            let name = dir
                                 .file_name()
                                 .map(|s| s.to_string_lossy().into_owned())
                                 .unwrap_or_else(|| "project".into());
-                            let pid = engine.registry_mut().add_project(name, cwd);
+                            let pid = engine.registry_mut().add_project(name, dir);
                             engine.registry_mut().set_active(pid);
                             picker = None;
                             scroll = 0;
                             dirty = true;
                         }
-                        KeyCode::Esc => picker = None,
+                        KeyCode::Backspace => {
+                            if !p.pop_query() {
+                                p.parent(); // query already empty → go up
+                            }
+                        }
+                        KeyCode::Char(c) if !ctrl && !c.is_control() => p.push_query(c),
+                        KeyCode::Esc => {
+                            if p.query.is_empty() {
+                                picker = None;
+                            } else {
+                                p.clear_query();
+                            }
+                        }
                         _ => {}
                     }
                 } else if input.is_some() {
@@ -1030,5 +1111,80 @@ impl Drop for TermGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let _ = crossterm::execute!(stdout(), LeaveAlternateScreen);
+    }
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::{list_subdirs, Picker};
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// A fresh unique temp directory containing the given subdirs.
+    fn scratch(subs: &[&str]) -> PathBuf {
+        let uniq = format!(
+            "awm-picker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(uniq);
+        for s in subs {
+            fs::create_dir_all(root.join(s)).unwrap();
+        }
+        root
+    }
+
+    fn name_of(p: &std::path::Path) -> String {
+        p.file_name().unwrap().to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn list_subdirs_is_dirs_only_sorted() {
+        let root = scratch(&["bb", "aa", "cc"]);
+        fs::write(root.join("file.txt"), b"x").unwrap(); // must be ignored
+        let names: Vec<String> = list_subdirs(&root).iter().map(|p| name_of(p)).collect();
+        assert_eq!(names, vec!["aa", "bb", "cc"]);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn picker_filter_narrows_to_prefix() {
+        let root = scratch(&["aa", "ab", "xy"]);
+        let mut p = Picker::open(root.clone());
+        assert_eq!(p.matches().len(), 3, "no filter shows all");
+
+        p.push_query('a');
+        let names: Vec<String> = p.matches().iter().map(|d| name_of(d)).collect();
+        assert_eq!(names, vec!["aa", "ab"], "prefix filter narrows the list");
+        // Highlight snapped to the first match (row after `../`).
+        assert_eq!(p.sel, usize::from(p.has_parent()));
+        assert_eq!(name_of(&p.selected_dir().unwrap()), "aa");
+
+        // Case-insensitive.
+        p.clear_query();
+        p.push_query('X');
+        assert_eq!(
+            p.matches().iter().map(|d| name_of(d)).collect::<Vec<_>>(),
+            vec!["xy"]
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn picker_parent_lands_on_child() {
+        let root = scratch(&["proj/inner", "other"]);
+        let mut p = Picker::open(root.join("proj"));
+        p.move_sel(1); // highlight `inner`
+        p.descend();
+        assert_eq!(p.cwd, root.join("proj").join("inner"));
+
+        // Going back up lands the highlight on the folder we came from.
+        p.parent();
+        assert_eq!(p.cwd, root.join("proj"));
+        assert_eq!(name_of(&p.selected_dir().unwrap()), "inner");
+        fs::remove_dir_all(&root).ok();
     }
 }

@@ -36,10 +36,13 @@ pub struct Tab {
 pub struct PickerView {
     /// The directory currently being browsed (shown as the title).
     pub path: String,
-    /// Row labels: `../` first (unless at root), then `name/` per subdirectory.
+    /// Row labels: `../` first (unless at root), then `name/` per matching
+    /// subdirectory (already filtered by `query`).
     pub entries: Vec<String>,
     /// Index of the highlighted row in `entries`.
     pub selected: usize,
+    /// The active prefix filter (empty = no filter). Shown in the title.
+    pub query: String,
 }
 
 /// The TUI renderer, generic over a ratatui backend.
@@ -143,10 +146,13 @@ impl<B: Backend> Renderer for AwmTui<B> {
 /// selection so it is always visible in long directories.
 fn render_picker(frame: &mut Frame, view: &PickerView, area: Rect) {
     let inner_w = area.width.saturating_sub(2) as usize;
-    let title = elide_left(&view.path, inner_w.saturating_sub(2));
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {title} "));
+    let path = elide_left(&view.path, inner_w.saturating_sub(2));
+    let title = if view.query.is_empty() {
+        format!(" {path} ")
+    } else {
+        format!(" {path} — find: {} ", view.query)
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
     frame.render_widget(&block, area);
     let inner = block.inner(area);
     if inner.height == 0 {
@@ -178,7 +184,7 @@ fn render_picker(frame: &mut Frame, view: &PickerView, area: Rect) {
         lines.push(Line::from(String::new()));
     }
     lines.push(Line::from(Span::styled(
-        "↑↓ move · Enter open · ⌫ up · s select this folder · Esc cancel",
+        "type: filter · ↑↓ move · Enter/→ open · ← up · Tab select · ⌫ del/up · Esc clear",
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(Paragraph::new(lines), inner);

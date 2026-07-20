@@ -262,15 +262,17 @@ fn picker_overlay_lists_dirs_and_legend() {
     use awm_tui::PickerView;
     let pv = PickerView {
         path: "/home/devops/prototupe".into(),
-        entries: vec!["../".into(), "crates/".into(), "docs/".into(), "scripts/".into()],
+        entries: vec!["../".into(), "crates/".into()],
         selected: 1,
+        query: "cr".into(),
     };
     let mut tui = AwmTui::new(TestBackend::new(70, 14)).unwrap();
     tui.draw(&sample_views(), &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)),
              None, 0, false, false, Some(&pv), &[]).unwrap();
     let out = buffer_to_string(tui.backend());
     assert!(out.contains("prototupe"), "title path:\n{out}");
-    assert!(out.contains("crates/"), "a subdir:\n{out}");
+    assert!(out.contains("find: cr"), "active filter shown in title:\n{out}");
+    assert!(out.contains("crates/"), "a matching subdir:\n{out}");
     assert!(out.contains("../"), "parent entry:\n{out}");
-    assert!(out.contains("select this folder"), "footer legend:\n{out}");
+    assert!(out.contains("Tab select"), "footer legend:\n{out}");
 }
