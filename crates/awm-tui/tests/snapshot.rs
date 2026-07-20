@@ -191,6 +191,9 @@ fn tall_transcript_autoscrolls_to_bottom() {
         None,
         u16::MAX, // ScrollTop — clamps to the very top.
         false,
+        false,
+        None,
+        &[],
     )
     .unwrap();
     let top = buffer_to_string(tui.backend());
@@ -208,4 +211,66 @@ fn triage_shows_only_listed_agents_in_order() {
         .unwrap();
 
     insta::assert_snapshot!("triage", buffer_to_string(tui.backend()));
+}
+
+#[test]
+fn project_tab_bar_marks_active_and_urgent() {
+    use awm_tui::Tab;
+    let mut tui = AwmTui::new(TestBackend::new(40, 8)).unwrap();
+    let views = sample_views();
+    let tabs = vec![
+        Tab { name: "awm".into(), active: true, urgent: false },
+        Tab { name: "web".into(), active: false, urgent: true },
+        Tab { name: "docs".into(), active: false, urgent: false },
+    ];
+    tui.draw(&views, &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)), None, 0, false, false, None, &tabs)
+        .unwrap();
+    let out = buffer_to_string(tui.backend());
+    let top = out.lines().next().unwrap_or_default();
+    // Numbered, named tabs on the top row; the urgent project carries a `!`.
+    assert!(top.contains("[1:awm]"), "top row: {top:?}");
+    assert!(top.contains("[2:web !]"), "urgent tab needs `!`: {top:?}");
+    assert!(top.contains("[3:docs]"), "top row: {top:?}");
+}
+
+#[test]
+fn no_tabs_keeps_layout_unchanged() {
+    // With an empty tab slice the top row is NOT a tab bar (byte-identical to the
+    // pre-projects layout — this is what the other snapshots rely on).
+    let mut tui = AwmTui::new(TestBackend::new(40, 8)).unwrap();
+    let views = sample_views();
+    tui.draw(&views, &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)), None, 0, false, false, None, &[])
+        .unwrap();
+    let out = buffer_to_string(tui.backend());
+    let top = out.lines().next().unwrap_or_default();
+    assert!(!top.contains("[1:"), "no tab bar without tabs: {top:?}");
+}
+
+#[test]
+fn help_overlay_lists_key_sections() {
+    let mut tui = AwmTui::new(TestBackend::new(70, 30)).unwrap();
+    tui.draw(&sample_views(), &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)),
+             None, 0, false, true, None, &[]).unwrap();
+    let out = buffer_to_string(tui.backend());
+    for needle in ["keybindings", "Screens", "Ctrl+w", "Ctrl+n", "close active", "quit"] {
+        assert!(out.contains(needle), "help overlay missing {needle:?}:\n{out}");
+    }
+}
+
+#[test]
+fn picker_overlay_lists_dirs_and_legend() {
+    use awm_tui::PickerView;
+    let pv = PickerView {
+        path: "/home/devops/prototupe".into(),
+        entries: vec!["../".into(), "crates/".into(), "docs/".into(), "scripts/".into()],
+        selected: 1,
+    };
+    let mut tui = AwmTui::new(TestBackend::new(70, 14)).unwrap();
+    tui.draw(&sample_views(), &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)),
+             None, 0, false, false, Some(&pv), &[]).unwrap();
+    let out = buffer_to_string(tui.backend());
+    assert!(out.contains("prototupe"), "title path:\n{out}");
+    assert!(out.contains("crates/"), "a subdir:\n{out}");
+    assert!(out.contains("../"), "parent entry:\n{out}");
+    assert!(out.contains("select this folder"), "footer legend:\n{out}");
 }

@@ -10,11 +10,11 @@
 
 use std::io::stdout;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use awm_core::{plan_layout, Engine, LayoutMode};
 use awm_pty::{CommandSpec, Decision};
-use awm_proto::{AgentId, Renderer, Tags};
+use awm_proto::{AgentId, AgentState, LineKind, Renderer, Tags};
 use awm_tui::keymap::{map_key, Action};
 use awm_tui::AwmTui;
 
@@ -67,6 +67,109 @@ impl Input {
     }
 }
 
+/// The directory browser (`Ctrl+n`): pick a folder to become a new project.
+struct Picker {
+    /// The directory currently being browsed.
+    cwd: PathBuf,
+    /// Its subdirectories, sorted (case-insensitive).
+    dirs: Vec<PathBuf>,
+    /// Highlighted row: 0 = `../` (unless at filesystem root), else `dirs[sel-1]`.
+    sel: usize,
+}
+
+impl Picker {
+    fn open(start: PathBuf) -> Self {
+        let mut p = Picker { cwd: start, dirs: Vec::new(), sel: 0 };
+        p.refresh();
+        p
+    }
+
+    fn refresh(&mut self) {
+        self.dirs = list_subdirs(&self.cwd);
+        self.sel = 0;
+    }
+
+    /// Whether row 0 is the `../` entry (present unless we're at the root).
+    fn has_parent(&self) -> bool {
+        self.cwd.parent().is_some()
+    }
+
+    /// Total rows (optional `../` + subdirs).
+    fn rows(&self) -> usize {
+        self.dirs.len() + usize::from(self.has_parent())
+    }
+
+    fn move_sel(&mut self, delta: isize) {
+        let n = self.rows() as isize;
+        if n == 0 {
+            return;
+        }
+        self.sel = (((self.sel as isize + delta) % n + n) % n) as usize;
+    }
+
+    /// The subdirectory a given row points at, if any (accounting for `../`).
+    fn dir_at(&self, row: usize) -> Option<&PathBuf> {
+        let base = usize::from(self.has_parent());
+        self.dirs.get(row.checked_sub(base)?)
+    }
+
+    /// Enter: descend into the highlighted subdir, or go up on `../`.
+    fn enter(&mut self) {
+        if self.has_parent() && self.sel == 0 {
+            self.parent();
+        } else if let Some(d) = self.dir_at(self.sel).cloned() {
+            self.cwd = d;
+            self.refresh();
+        }
+    }
+
+    fn parent(&mut self) {
+        if let Some(p) = self.cwd.parent() {
+            self.cwd = p.to_path_buf();
+            self.refresh();
+        }
+    }
+
+    /// Render DTO for the TUI overlay.
+    fn view(&self) -> awm_tui::PickerView {
+        let mut entries: Vec<String> = Vec::new();
+        if self.has_parent() {
+            entries.push("../".into());
+        }
+        for d in &self.dirs {
+            let name = d
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            entries.push(format!("{name}/"));
+        }
+        awm_tui::PickerView {
+            path: self.cwd.display().to_string(),
+            entries,
+            selected: self.sel,
+        }
+    }
+}
+
+/// List the immediate subdirectories of `dir`, sorted case-insensitively by name.
+/// Best-effort: an unreadable directory yields an empty list.
+fn list_subdirs(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.path())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    dirs.sort_by_key(|p| {
+        p.file_name()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    });
+    dirs
+}
+
 /// Lines scrolled per PgUp/PgDn.
 const SCROLL_STEP: u16 = 8;
 
@@ -77,6 +180,60 @@ fn next_mode(current: &str) -> &'static str {
         "plan" => "acceptEdits",
         _ => "default",
     }
+}
+
+/// Path to the persisted session file: `$XDG_STATE_HOME/awm/session.json`, else
+/// `$HOME/.local/state/awm/session.json`. `None` when neither var is set.
+fn session_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("state")))?;
+    Some(base.join("awm").join("session.json"))
+}
+
+/// Load the saved session, if any. Best-effort: a missing or malformed file
+/// yields `None` (we just start clean).
+fn load_session() -> Option<awm_core::SessionState> {
+    let bytes = std::fs::read(session_path()?).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Persist the current session snapshot. Best-effort — a failed save (no HOME,
+/// read-only fs, …) is swallowed so it never disrupts the UI.
+fn save_session(engine: &Engine) {
+    let Some(path) = session_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&engine.registry().snapshot()) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+/// The live-`claude` command spec (persistent stream-json session). With
+/// `resume = Some(session_id)` it adds `--resume <id>` to continue a prior
+/// session instead of starting a new one.
+///
+/// `--permission-prompt-tool stdio` routes approval gates to us over the control
+/// channel as `can_use_tool` requests (see docs/approval-findings.md). No `-p`:
+/// a persistent streaming session that stays alive across turns (like the Agent
+/// SDK). stdin is closed on shutdown to end it.
+fn claude_spec(cwd: PathBuf, resume: Option<&str>) -> CommandSpec {
+    let mut spec = CommandSpec::new("claude", cwd)
+        .arg("--input-format")
+        .arg("stream-json")
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--verbose")
+        .arg("--permission-prompt-tool")
+        .arg("stdio")
+        .arg("--include-partial-messages");
+    if let Some(id) = resume {
+        spec = spec.arg("--resume").arg(id);
+    }
+    spec
 }
 
 fn mock_script() -> PathBuf {
@@ -168,19 +325,7 @@ fn spec_for(kind: &Spawn) -> (CommandSpec, Option<String>, bool, bool) {
         }
         Spawn::Claude(prompt) => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-            // `--permission-prompt-tool stdio` routes approval gates to us over the
-            // control channel as `can_use_tool` requests (see docs/approval-findings.md).
-            // No `-p`: a persistent streaming session that stays alive across
-            // turns (like the Agent SDK). stdin is closed on shutdown to end it.
-            let spec = CommandSpec::new("claude", cwd)
-                .arg("--input-format")
-                .arg("stream-json")
-                .arg("--output-format")
-                .arg("stream-json")
-                .arg("--verbose")
-                .arg("--permission-prompt-tool")
-                .arg("stdio")
-                .arg("--include-partial-messages");
+            let spec = claude_spec(cwd, None);
             let prompt = if prompt.is_empty() { None } else { Some(prompt.clone()) };
             (spec, prompt, true, true)
         }
@@ -201,8 +346,17 @@ fn main() -> std::io::Result<()> {
         return run_probe_subagent(prompt);
     }
 
+    // Headless spike: does `claude --resume <session_id>` continue a persistent
+    // stream-json session? Drives one live claude, captures its session_id, kills
+    // it, then resumes and asks it to recall context. Gates Phase-4 live restore.
+    if args.iter().any(|a| a == "--probe-resume") {
+        return run_probe_resume();
+    }
+
     // Build the initial roster: --claude <prompt> (repeatable), else mock agents.
+    // `--fresh` ignores any saved session and starts clean.
     let mut roster: Vec<Spawn> = Vec::new();
+    let mut fresh = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -218,13 +372,14 @@ fn main() -> std::io::Result<()> {
             "--convo" => roster.push(Spawn::MockConvo),
             "--md" => roster.push(Spawn::MockMd),
             "--subagents" => roster.push(Spawn::MockSubagents),
+            "--fresh" => fresh = true,
             _ => {}
         }
     }
     if roster.is_empty() {
         roster = vec![Spawn::Mock, Spawn::Mock, Spawn::Mock];
     }
-    run_interactive(roster)
+    run_interactive(roster, fresh)
 }
 
 /// Headless demo: block → promote to master → approve → resume.
@@ -265,7 +420,6 @@ fn run_demo() -> std::io::Result<()> {
 /// raw stream to `captures/agent-<id>.jsonl`. Prints, never renders a TUI.
 fn run_probe_subagent(prompt: String) -> std::io::Result<()> {
     use std::collections::HashSet;
-    use std::time::Instant;
 
     let mut engine = Engine::new();
     let (spec, prompt, handshake, persistent) = spec_for(&Spawn::Claude(prompt));
@@ -325,22 +479,185 @@ fn run_probe_subagent(prompt: String) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Interactive TUI loop. Restores the terminal on drop (even on panic).
-fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
+/// Join the Text lines of an agent's transcript into one string (for the probe).
+fn tail_text(engine: &Engine, id: AgentId) -> String {
+    engine
+        .registry()
+        .record(id)
+        .map(|r| {
+            r.tail
+                .iter()
+                .filter(|l| matches!(l.kind, LineKind::Text))
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// A short one-line preview of a reply.
+fn snippet(s: &str) -> String {
+    s.trim().replace('\n', " ").chars().take(120).collect()
+}
+
+/// Headless spike (Phase 3 gate): does `claude --resume <session_id>` continue a
+/// persistent stream-json session? Turn 1 plants a secret and captures the
+/// session_id; turn 2 resumes that id and checks whether the model recalls the
+/// secret (i.e. the conversation context was truly restored). Prints a verdict;
+/// record it in docs/resume-findings.md. Never renders a TUI.
+fn run_probe_resume() -> std::io::Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+    let secret = "BANANA47";
+
+    // --- Turn 1: fresh session, plant a secret, capture the session_id. ---
+    println!("── probe-resume: turn 1 (plant secret, capture session_id) ──");
     let mut engine = Engine::new();
-    for (i, kind) in roster.iter().enumerate() {
-        let (spec, prompt, handshake, persistent) = spec_for(kind);
-        let name = match kind {
-            Spawn::Mock => format!("mock-{i}"),
-            Spawn::MockChat => format!("chat-{i}"),
-            Spawn::MockWork => format!("work-{i}"),
-            Spawn::MockStream => format!("stream-{i}"),
-            Spawn::MockConvo => format!("convo-{i}"),
-            Spawn::MockMd => format!("md-{i}"),
-            Spawn::MockSubagents => format!("subs-{i}"),
-            Spawn::Claude(_) => format!("claude-{i}"),
-        };
-        engine.spawn(spec, name, Tags::empty(), prompt, handshake, persistent)?;
+    let spec = claude_spec(cwd.clone(), None);
+    let id = engine.spawn(
+        spec,
+        "probe",
+        Tags::empty(),
+        Some(format!("Remember this secret code: {secret}. Reply with just the word OK.")),
+        true,
+        true,
+    )?;
+
+    let start = std::time::Instant::now();
+    let mut session_id: Option<String> = None;
+    while start.elapsed() < Duration::from_secs(120) {
+        engine.pump_blocking(Duration::from_millis(200));
+        for b in engine.registry().blocked_ordered() {
+            let _ = engine.answer(b, Decision::Allow);
+        }
+        if session_id.is_none() {
+            session_id = engine
+                .registry()
+                .record(id)
+                .and_then(|r| r.info.as_ref())
+                .and_then(|i| i.session_id.clone());
+            if let Some(s) = &session_id {
+                println!("  captured session_id = {s}");
+            }
+        }
+        // A persistent agent goes Idle once its turn ends.
+        let idle = matches!(
+            engine.registry().record(id).map(|r| r.state),
+            Some(AgentState::Idle)
+        );
+        if session_id.is_some() && idle && !tail_text(&engine, id).is_empty() {
+            break;
+        }
+    }
+    println!("  turn1 reply: {:?}", snippet(&tail_text(&engine, id)));
+    engine.shutdown();
+    engine.join();
+
+    let Some(sid) = session_id else {
+        println!("\n❌ VERDICT: never captured a session_id — cannot test resume.");
+        return Ok(());
+    };
+
+    // --- Turn 2: resume that session, ask it to recall the secret. ---
+    println!("\n── probe-resume: turn 2 (--resume {sid}, recall the secret) ──");
+    let mut engine2 = Engine::new();
+    let spec2 = claude_spec(cwd, Some(&sid));
+    let id2 = engine2.spawn(
+        spec2,
+        "probe-resumed",
+        Tags::empty(),
+        Some("What is the secret code I told you earlier? Reply with just the code.".into()),
+        true,
+        true,
+    )?;
+
+    let start2 = std::time::Instant::now();
+    let mut ran = false; // did the resumed process produce ANY output?
+    let mut recalled = false;
+    while start2.elapsed() < Duration::from_secs(120) {
+        engine2.pump_blocking(Duration::from_millis(200));
+        for b in engine2.registry().blocked_ordered() {
+            let _ = engine2.answer(b, Decision::Allow);
+        }
+        let reply = tail_text(&engine2, id2);
+        ran |= !reply.is_empty();
+        if reply.contains(secret) {
+            recalled = true;
+            break;
+        }
+        match engine2.registry().record(id2).map(|r| r.state) {
+            Some(AgentState::Failed) => break, // died — resume likely unsupported here
+            Some(AgentState::Idle) if !reply.is_empty() => break,
+            _ => {}
+        }
+    }
+    let failed = matches!(
+        engine2.registry().record(id2).map(|r| r.state),
+        Some(AgentState::Failed)
+    );
+    println!("  turn2 reply: {:?}", snippet(&tail_text(&engine2, id2)));
+    engine2.shutdown();
+    engine2.join();
+
+    println!("\n──────── PROBE-RESUME VERDICT ────────");
+    println!("  session_id captured : yes ({sid})");
+    println!("  resumed process ran : {}", if ran && !failed { "yes" } else { "NO" });
+    println!("  recalled the secret : {}", if recalled { "YES (context resumed)" } else { "no" });
+    if recalled {
+        println!("\n✅ `claude --resume` WORKS in stream-json input mode → Phase 4 live restore is viable.");
+    } else if ran && !failed {
+        println!("\n⚠️  Resume ran but did not recall context — inspect the reply above.");
+    } else {
+        println!("\n❌ Resume did not run in stream-json input mode → Phase 4 needs the fallback.");
+    }
+    Ok(())
+}
+
+/// Interactive TUI loop. Restores the terminal on drop (even on panic).
+fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
+    let mut engine = Engine::new();
+
+    // Restore a saved session (projects + panes as read-only history) unless the
+    // user asked for a clean start or there is nothing saved. Otherwise, name the
+    // default project after cwd and spawn the initial roster.
+    let restored = if fresh { None } else { load_session() };
+    if let Some(state) = &restored {
+        engine.registry_mut().restore(state);
+        // Bring each root pane back LIVE via `claude --resume <session_id>` (the
+        // spike in docs/resume-findings.md confirms this restores context). Mocks
+        // have no session_id → they stay as read-only history; sub-agent panes
+        // share the root process and are recreated when the resumed root works.
+        for snap in &state.agents {
+            if snap.is_subagent || !snap.resumable {
+                continue; // mocks (not resumable) stay as read-only history
+            }
+            if let Some(sid) = &snap.session_id {
+                let spec = claude_spec(snap.meta.cwd.clone(), Some(sid));
+                let _ = engine.resume_agent(snap.meta.id, spec, None, true, true);
+            }
+        }
+    } else {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        let name = cwd
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "main".into());
+        let active = engine.registry().active();
+        engine.registry_mut().set_project_meta(active, name, cwd);
+
+        for (i, kind) in roster.iter().enumerate() {
+            let (spec, prompt, handshake, persistent) = spec_for(kind);
+            let name = match kind {
+                Spawn::Mock => format!("mock-{i}"),
+                Spawn::MockChat => format!("chat-{i}"),
+                Spawn::MockWork => format!("work-{i}"),
+                Spawn::MockStream => format!("stream-{i}"),
+                Spawn::MockConvo => format!("convo-{i}"),
+                Spawn::MockMd => format!("md-{i}"),
+                Spawn::MockSubagents => format!("subs-{i}"),
+                Spawn::Claude(_) => format!("claude-{i}"),
+            };
+            engine.spawn(spec, name, Tags::empty(), prompt, handshake, persistent)?;
+        }
     }
     // Remember what Mod+p should spawn (first roster kind, or Mock).
     let spawn_kind = roster.first().cloned().unwrap_or(Spawn::Mock);
@@ -349,20 +666,48 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
     let mut tui = AwmTui::new(CrosstermBackend::new(stdout()))?;
     let mut mode = LayoutMode::Tiling;
     let mut input: Option<Input> = None;
+    let mut picker: Option<Picker> = None; // directory browser (Ctrl+n)
     let mut scroll: u16 = 0; // focused pane's scrollback offset (0 = follow bottom)
     let mut prev_focus: Option<AgentId> = None; // to snap to bottom on focus change
     let mut show_card = false; // agent inspection card toggle
+    let mut show_help = false; // keybinding help overlay (toggled by `?`)
+    let mut last_save = Instant::now(); // periodic session autosave
+    let mut dirty = false; // a structural change awaiting an immediate save
 
     loop {
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
-                if input.is_some() {
+                if let Some(p) = picker.as_mut() {
+                    // Directory-browser mode (Ctrl+n): navigate, `s` selects the
+                    // current folder as a new project, Esc cancels.
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => p.move_sel(-1),
+                        KeyCode::Down | KeyCode::Char('j') => p.move_sel(1),
+                        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => p.enter(),
+                        KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => p.parent(),
+                        KeyCode::Char('s') | KeyCode::Char(' ') => {
+                            let cwd = p.cwd.clone();
+                            let name = cwd
+                                .file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "project".into());
+                            let pid = engine.registry_mut().add_project(name, cwd);
+                            engine.registry_mut().set_active(pid);
+                            picker = None;
+                            scroll = 0;
+                            dirty = true;
+                        }
+                        KeyCode::Esc => picker = None,
+                        _ => {}
+                    }
+                } else if input.is_some() {
                     // Text-entry mode (spawn prompt or a message to an agent).
                     match key.code {
                         KeyCode::Enter => match input.take() {
                             Some(Input::Spawn(text)) if !text.is_empty() => {
                                 spawn_typed(&mut engine, &spawn_kind, text);
                                 scroll = 0; // snap to the newest output
+                                dirty = true;
                             }
                             Some(Input::Message(id, text)) if !text.is_empty() => {
                                 let _ = engine.send_message(id, &text);
@@ -388,10 +733,38 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
                     // Direct keys not covered by the shared keymap.
                     match key.code {
                         KeyCode::Char('q') if !ctrl => break,
+                        // `?` — toggle the keybinding help overlay; Esc closes it.
+                        KeyCode::Char('?') if !ctrl => show_help = !show_help,
+                        KeyCode::Esc => show_help = false,
                         // `i` — talk to the focused agent (send a follow-up).
                         KeyCode::Char('i') if !ctrl => {
                             if let Some(f) = engine.registry().focus() {
                                 input = Some(Input::Message(f, String::new()));
+                            }
+                        }
+                        // `r` — resume a restored (dead) pane into a live claude
+                        // session via its saved session_id. No-op if already live,
+                        // or if the pane has no session_id (e.g. a mock).
+                        KeyCode::Char('r') if !ctrl => {
+                            if let Some(f) = engine.registry().focus() {
+                                if !engine.is_live(f) {
+                                    let info = engine.registry().record(f).map(|r| {
+                                        (
+                                            r.resumable,
+                                            r.info
+                                                .as_ref()
+                                                .and_then(|i| i.session_id.clone()),
+                                            r.meta.cwd.clone(),
+                                        )
+                                    });
+                                    if let Some((true, Some(sid), cwd)) = info {
+                                        let spec = claude_spec(cwd, Some(&sid));
+                                        let _ = engine
+                                            .resume_agent(f, spec, None, true, true);
+                                        scroll = 0;
+                                        dirty = true;
+                                    }
+                                }
                             }
                         }
                         KeyCode::Char('t') if ctrl => {
@@ -404,6 +777,7 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
                         KeyCode::Char('x') if ctrl => {
                             if let Some(f) = engine.registry().focus() {
                                 engine.kill(f);
+                                dirty = true;
                             }
                         }
                         _ => {
@@ -421,6 +795,41 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
                                     Action::ScrollTop => scroll = u16::MAX,
                                     Action::ScrollBottom => scroll = 0,
                                     Action::Inspect => show_card = !show_card,
+                                    // Open the directory browser to pick a folder
+                                    // for a new project — starting at the active
+                                    // project's cwd (else the process cwd).
+                                    Action::NewProject => {
+                                        let start = engine
+                                            .registry()
+                                            .projects()
+                                            .get(engine.registry().active_index())
+                                            .map(|p| p.cwd.clone())
+                                            .filter(|c| c.is_dir())
+                                            .unwrap_or_else(|| {
+                                                std::env::current_dir()
+                                                    .unwrap_or_else(|_| std::env::temp_dir())
+                                            });
+                                        picker = Some(Picker::open(start));
+                                    }
+                                    // Switch screens (projects). Snap scroll so the
+                                    // new screen's focused pane follows its newest output.
+                                    Action::SwitchProject(n) => {
+                                        engine.registry_mut().switch_to(n as usize);
+                                        scroll = 0;
+                                        dirty = true;
+                                    }
+                                    Action::NextProject => {
+                                        engine.registry_mut().next_project();
+                                        scroll = 0;
+                                        dirty = true;
+                                    }
+                                    // Close the active screen (kills its agents).
+                                    // The last remaining screen can't be closed.
+                                    Action::CloseProject => {
+                                        engine.close_active_project();
+                                        scroll = 0;
+                                        dirty = true;
+                                    }
                                     // Shift+Tab: cycle the focused agent's mode.
                                     Action::CycleMode => {
                                         if let Some(f) = engine.registry().focus() {
@@ -475,15 +884,63 @@ fn run_interactive(roster: Vec<Spawn>) -> std::io::Result<()> {
             .min(u16::MAX as usize) as u16;
         scroll = scroll.min(max_scroll);
 
+        // Build the project tab bar (name + active + cross-screen urgent `!`).
+        let tabs: Vec<awm_tui::Tab> = {
+            let reg = engine.registry();
+            let active = reg.active();
+            reg.projects()
+                .iter()
+                .map(|p| awm_tui::Tab {
+                    name: p.name.clone(),
+                    active: p.id == active,
+                    urgent: reg.project_is_urgent(p.id),
+                })
+                .collect()
+        };
+
         let bar = input.as_ref().map(|i| i.bar());
-        tui.draw(&views, &layout, focus, bar.as_deref(), scroll, show_card)?;
+        let picker_view = picker.as_ref().map(|p| p.view());
+        tui.draw(
+            &views,
+            &layout,
+            focus,
+            bar.as_deref(),
+            scroll,
+            show_card,
+            show_help,
+            picker_view.as_ref(),
+            &tabs,
+        )?;
+
+        // Persist immediately after a structural change, else on a ~5s heartbeat
+        // (so growing transcripts survive a crash between structural edits).
+        if dirty || last_save.elapsed() >= Duration::from_secs(5) {
+            save_session(&engine);
+            last_save = Instant::now();
+            dirty = false;
+        }
     }
+    // Final save captures the last transcripts before we tear down processes.
+    save_session(&engine);
     engine.shutdown();
     Ok(())
 }
 
+/// The working directory of the active project — where a newly-spawned agent
+/// should run. Falls back to the process cwd if the project has no cwd set.
+fn active_project_cwd(engine: &Engine) -> PathBuf {
+    engine
+        .registry()
+        .projects()
+        .get(engine.registry().active_index())
+        .map(|p| p.cwd.clone())
+        .filter(|c| !c.as_os_str().is_empty())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()))
+}
+
 /// Spawn an agent from a typed prompt, using the app's spawn kind (Claude gets
-/// the prompt; mock ignores it but still spawns).
+/// the prompt; mock ignores it but still spawns). Runs in the ACTIVE project's
+/// working directory so an agent on a `web` screen operates in `web`'s folder.
 fn spawn_typed(engine: &mut Engine, kind: &Spawn, text: String) {
     let spawn = match kind {
         Spawn::Claude(_) => Spawn::Claude(text),
@@ -495,12 +952,13 @@ fn spawn_typed(engine: &mut Engine, kind: &Spawn, text: String) {
         Spawn::MockSubagents => Spawn::MockSubagents,
         Spawn::Mock => Spawn::Mock,
     };
-    let (spec, prompt, handshake, persistent) = spec_for(&spawn);
+    let cwd = active_project_cwd(engine);
+    let (mut spec, prompt, handshake, persistent) = spec_for(&spawn);
+    spec.cwd = cwd; // run in the active project's folder, not awm's cwd
     let _ = engine.spawn(spec, "spawned", Tags::empty(), prompt, handshake, persistent);
 }
 
 fn handle_action(action: Action, engine: &mut Engine, mode: &mut LayoutMode, spawn_kind: &Spawn) {
-    let reg = engine.registry();
     match action {
         Action::FocusNext => engine.registry_mut().focus_step(1),
         Action::FocusPrev => engine.registry_mut().focus_step(-1),
@@ -514,13 +972,10 @@ fn handle_action(action: Action, engine: &mut Engine, mode: &mut LayoutMode, spa
         }
         // No interactive session to enter in headless mode — expand the request.
         Action::EditInline => *mode = LayoutMode::Monocle,
-        Action::ToggleTag(n) => {
-            if let Some(f) = reg.focus() {
-                engine.registry_mut().toggle_tag(f, n);
-            }
-        }
         Action::SpawnPrompt => {
-            let (spec, prompt, handshake, persistent) = spec_for(spawn_kind);
+            let cwd = active_project_cwd(engine);
+            let (mut spec, prompt, handshake, persistent) = spec_for(spawn_kind);
+            spec.cwd = cwd; // run in the active project's folder
             let _ = engine.spawn(spec, "spawned", Tags::empty(), prompt, handshake, persistent);
         }
         Action::Approve => answer_target(engine, Decision::Allow),

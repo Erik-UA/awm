@@ -94,6 +94,12 @@ pub struct AgentInfo {
     pub plugins: Vec<String>,
     pub slash_commands: Vec<String>,
     pub agents: Vec<String>,
+    /// The Claude `session_id` carried on every stream-json line — the key used
+    /// to bring a persisted session back live via `claude --resume <id>`. `None`
+    /// for mock agents and on older wire versions. `#[serde(default)]` keeps old
+    /// snapshots/fixtures (which lack the field) parseable.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Cumulative token usage for a session.

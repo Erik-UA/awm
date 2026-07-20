@@ -10,6 +10,7 @@ description = "Event bus, agent registry, and layout engine for awm (Phase 3 int
 awm-proto = { workspace = true }
 awm-pty = { workspace = true }
 awm-parser = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

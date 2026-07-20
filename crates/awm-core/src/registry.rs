@@ -8,7 +8,23 @@ use awm_proto::{
     AgentEvent, AgentId, AgentInfo, AgentMeta, AgentState, AgentView, ApprovalCtx, LineKind, Tags,
     TokenUsage, TranscriptLine,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+
+/// Opaque, stable identifier for a project (screen) within an `awm` session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ProjectId(pub u32);
+
+/// A project — one "screen" the user switches between. Each project owns a
+/// disjoint set of agents (partition of the roster) plus its own focus, and is
+/// defined by a human name and the working directory its agents run in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Project {
+    pub id: ProjectId,
+    pub name: String,
+    pub cwd: PathBuf,
+}
 
 /// How many recent transcript lines to keep per agent for the pane body.
 const TAIL_CAP: usize = 400;
@@ -29,6 +45,11 @@ pub struct AgentRecord {
     pub pending: Option<ApprovalCtx>,
     /// Session metadata from `init` (model, mode, tools/skills/plugins…).
     pub info: Option<AgentInfo>,
+    /// Whether this agent is a live-resumable Claude session (spawned with the
+    /// control-channel handshake), as opposed to a mock. Only these are brought
+    /// back live via `claude --resume` on restore — a mock's `session_id` (e.g.
+    /// `"mock-1"`) is not a real Claude session.
+    pub resumable: bool,
     /// Whether the last tail line is an in-progress streamed reply.
     streaming: bool,
 }
@@ -52,16 +73,52 @@ impl AgentRecord {
     }
 }
 
-/// The set of agents plus focus and an internal wait clock.
-#[derive(Default)]
+/// The set of agents plus per-project focus and an internal wait clock.
+///
+/// Agents live in one global map (ids are unique session-wide) but are
+/// partitioned into *projects* (screens) via [`Registry::project_of`]. The
+/// render-facing accessors ([`Registry::views`], [`Registry::blocked_ordered`],
+/// [`Registry::focus`], [`Registry::active_order`]) are scoped to the **active**
+/// project, so switching projects re-scopes the whole layout for free.
 pub struct Registry {
     agents: HashMap<AgentId, AgentRecord>,
-    /// Stable insertion order (drives stack ordering and focus cycling).
+    /// Stable insertion order across ALL projects (drives per-project stack
+    /// ordering, after filtering by [`Registry::project_of`]).
     order: Vec<AgentId>,
-    focus: Option<AgentId>,
     /// Monotonic counter stamped onto each block, so blocked agents sort by wait.
     clock: u64,
     next_id: u32,
+    /// Every project (screen), in creation order (`switch_to` indexes this).
+    projects: Vec<Project>,
+    /// The currently-shown project.
+    active: ProjectId,
+    /// Which project each agent belongs to.
+    project_of: HashMap<AgentId, ProjectId>,
+    /// Focused agent per project, so switching screens preserves each screen's
+    /// focus. `focus()` returns the active project's entry.
+    focus_by_project: HashMap<ProjectId, AgentId>,
+    next_project_id: u32,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        let mut reg = Registry {
+            agents: HashMap::new(),
+            order: Vec::new(),
+            clock: 0,
+            next_id: 0,
+            projects: Vec::new(),
+            active: ProjectId(0),
+            project_of: HashMap::new(),
+            focus_by_project: HashMap::new(),
+            next_project_id: 0,
+        };
+        // Every registry starts with one default project so there is always a
+        // screen to spawn into. The binary renames it to the real cwd.
+        let id = reg.add_project("main", PathBuf::new());
+        reg.active = id;
+        reg
+    }
 }
 
 impl Registry {
@@ -86,43 +143,69 @@ impl Registry {
             blocked_since: None,
             pending: None,
             info: None,
+            resumable: false,
             streaming: false,
         }
     }
 
-    /// Register a new (Idle) agent. Focuses it if nothing is focused yet.
-    pub fn add(&mut self, meta: AgentMeta) {
-        let id = meta.id;
-        self.agents.insert(id, Self::fresh(meta));
-        self.order.push(id);
-        if self.focus.is_none() {
-            self.focus = Some(id);
+    /// Mark whether this agent is a live-resumable Claude session (see the field).
+    pub fn set_resumable(&mut self, id: AgentId, resumable: bool) {
+        if let Some(rec) = self.agents.get_mut(&id) {
+            rec.resumable = resumable;
         }
+    }
+
+    /// Register a new (Idle) agent in the **active** project. Focuses it if that
+    /// project has no focus yet.
+    pub fn add(&mut self, meta: AgentMeta) {
+        let proj = self.active;
+        self.add_in(proj, None, meta);
     }
 
     /// Register a new (Idle) agent immediately after `anchor` in roster order, so
-    /// a spawned sub-agent lands adjacent to its parent in the stack. Appends if
-    /// `anchor` is unknown. Never steals focus (like [`Registry::add`]).
+    /// a spawned sub-agent lands adjacent to its parent in the stack. The new
+    /// agent **inherits `anchor`'s project** (a background sub-agent must not leak
+    /// onto whatever screen is currently active). Appends if `anchor` is unknown.
     pub fn add_after(&mut self, anchor: AgentId, meta: AgentMeta) {
+        let proj = self.project_of.get(&anchor).copied().unwrap_or(self.active);
+        self.add_in(proj, Some(anchor), meta);
+    }
+
+    /// Shared insert path: place `meta` in `proj`, either after `anchor` or at the
+    /// end of the roster, and give `proj` a focus if it lacked one.
+    fn add_in(&mut self, proj: ProjectId, anchor: Option<AgentId>, meta: AgentMeta) {
         let id = meta.id;
         self.agents.insert(id, Self::fresh(meta));
-        match self.order.iter().position(|i| *i == anchor) {
+        match anchor.and_then(|a| self.order.iter().position(|i| *i == a)) {
             Some(pos) => self.order.insert(pos + 1, id),
             None => self.order.push(id),
         }
-        if self.focus.is_none() {
-            self.focus = Some(id);
-        }
+        self.project_of.insert(id, proj);
+        self.focus_by_project.entry(proj).or_insert(id);
     }
 
     /// Remove an agent entirely — used to retire a finished sub-agent's pane once
-    /// its parent's turn ends. Moves focus to the first remaining agent if it was
-    /// focused. No-op if unknown.
+    /// its parent's turn ends. Moves that project's focus to its first remaining
+    /// agent if the removed one was focused. No-op if unknown.
     pub fn remove(&mut self, id: AgentId) {
         self.agents.remove(&id);
         self.order.retain(|i| *i != id);
-        if self.focus == Some(id) {
-            self.focus = self.order.first().copied();
+        if let Some(proj) = self.project_of.remove(&id) {
+            if self.focus_by_project.get(&proj) == Some(&id) {
+                match self
+                    .order
+                    .iter()
+                    .find(|i| self.project_of.get(i) == Some(&proj))
+                    .copied()
+                {
+                    Some(next) => {
+                        self.focus_by_project.insert(proj, next);
+                    }
+                    None => {
+                        self.focus_by_project.remove(&proj);
+                    }
+                }
+            }
         }
     }
 
@@ -200,20 +283,23 @@ impl Registry {
         }
     }
 
-    /// Render DTOs in roster order.
+    /// Render DTOs for the **active** project, in roster order.
     pub fn views(&self) -> Vec<AgentView> {
         self.order
             .iter()
+            .filter(|id| self.project_of.get(id) == Some(&self.active))
             .filter_map(|id| self.agents.get(id))
             .map(AgentRecord::view)
             .collect()
     }
 
-    /// Blocked agents, oldest-waiting first (drives urgent → master and triage).
+    /// Blocked agents **in the active project**, oldest-waiting first (drives
+    /// urgent → master and triage within the current screen).
     pub fn blocked_ordered(&self) -> Vec<AgentId> {
         let mut blocked: Vec<(&AgentId, u64)> = self
             .order
             .iter()
+            .filter(|id| self.project_of.get(id) == Some(&self.active))
             .filter_map(|id| {
                 let rec = self.agents.get(id)?;
                 rec.blocked_since.map(|since| (id, since))
@@ -223,18 +309,151 @@ impl Registry {
         blocked.into_iter().map(|(id, _)| *id).collect()
     }
 
+    /// The global roster order across all projects.
     pub fn order(&self) -> &[AgentId] {
         &self.order
     }
 
-    pub fn focus(&self) -> Option<AgentId> {
-        self.focus
+    /// The active project's roster order (what the layout engine plans over).
+    pub fn active_order(&self) -> Vec<AgentId> {
+        self.order
+            .iter()
+            .filter(|id| self.project_of.get(id) == Some(&self.active))
+            .copied()
+            .collect()
     }
 
+    pub fn focus(&self) -> Option<AgentId> {
+        self.focus_by_project.get(&self.active).copied()
+    }
+
+    /// Focus `id` within its own project (no-op if unknown).
     pub fn set_focus(&mut self, id: AgentId) {
-        if self.agents.contains_key(&id) {
-            self.focus = Some(id);
+        if let Some(&proj) = self.project_of.get(&id) {
+            self.focus_by_project.insert(proj, id);
         }
+    }
+
+    // ---- Projects (screens) -------------------------------------------------
+
+    /// Create a new project and return its id (does not switch to it).
+    pub fn add_project(&mut self, name: impl Into<String>, cwd: PathBuf) -> ProjectId {
+        let id = ProjectId(self.next_project_id);
+        self.next_project_id += 1;
+        self.projects.push(Project {
+            id,
+            name: name.into(),
+            cwd,
+        });
+        id
+    }
+
+    /// Overwrite a project's name/cwd (used to name the default project after the
+    /// real working directory). No-op if unknown.
+    pub fn set_project_meta(&mut self, id: ProjectId, name: impl Into<String>, cwd: PathBuf) {
+        if let Some(p) = self.projects.iter_mut().find(|p| p.id == id) {
+            p.name = name.into();
+            p.cwd = cwd;
+        }
+    }
+
+    /// Every project (screen), in creation order.
+    pub fn projects(&self) -> &[Project] {
+        &self.projects
+    }
+
+    /// The currently-shown project.
+    pub fn active(&self) -> ProjectId {
+        self.active
+    }
+
+    /// Zero-based index of the active project in [`Registry::projects`].
+    pub fn active_index(&self) -> usize {
+        self.projects
+            .iter()
+            .position(|p| p.id == self.active)
+            .unwrap_or(0)
+    }
+
+    /// Switch to a project by id (no-op if unknown).
+    pub fn set_active(&mut self, id: ProjectId) {
+        if self.projects.iter().any(|p| p.id == id) {
+            self.active = id;
+        }
+    }
+
+    /// Switch to the `n`-th project (1-based, as bound to `Mod+1..9`). No-op if
+    /// out of range.
+    pub fn switch_to(&mut self, n: usize) {
+        if let Some(p) = n.checked_sub(1).and_then(|i| self.projects.get(i)) {
+            self.active = p.id;
+        }
+    }
+
+    /// Cycle to the next project (screen), wrapping. The terminal-friendly way to
+    /// switch when `Mod+digit` isn't encoded distinctly.
+    pub fn next_project(&mut self) {
+        if self.projects.is_empty() {
+            return;
+        }
+        let next = (self.active_index() + 1) % self.projects.len();
+        self.active = self.projects[next].id;
+    }
+
+    /// Every agent currently in `project`, in roster order.
+    pub fn agents_in(&self, project: ProjectId) -> Vec<AgentId> {
+        self.order
+            .iter()
+            .filter(|id| self.project_of.get(id) == Some(&project))
+            .copied()
+            .collect()
+    }
+
+    /// Drop every agent pane in `project` but keep the project itself — used to
+    /// "close" the sole remaining screen (which can't be removed) by emptying it.
+    /// Callers should terminate the agents' processes first (via the engine).
+    pub fn clear_project(&mut self, project: ProjectId) {
+        for aid in self.agents_in(project) {
+            self.agents.remove(&aid);
+            self.order.retain(|i| *i != aid);
+            self.project_of.remove(&aid);
+        }
+        self.focus_by_project.remove(&project);
+    }
+
+    /// Remove a project and drop any agent panes still in it, switching the active
+    /// project to a neighbour. Returns `false` (no-op) when it is the only project
+    /// — there must always be at least one screen. Callers should terminate the
+    /// agents' processes first (via the engine); this only drops their panes.
+    pub fn remove_project(&mut self, id: ProjectId) -> bool {
+        let Some(idx) = self.projects.iter().position(|p| p.id == id) else {
+            return false;
+        };
+        if self.projects.len() <= 1 {
+            return false;
+        }
+        for aid in self.agents_in(id) {
+            self.agents.remove(&aid);
+            self.order.retain(|i| *i != aid);
+            self.project_of.remove(&aid);
+        }
+        self.focus_by_project.remove(&id);
+        self.projects.remove(idx);
+        if self.active == id {
+            // Switch to the neighbour that now occupies this slot (or the last).
+            let ni = idx.min(self.projects.len() - 1);
+            self.active = self.projects[ni].id;
+        }
+        true
+    }
+
+    /// Whether any agent in `id` is blocked or sticky-urgent — drives the `!`
+    /// indicator on a background project's tab (dwm urgent-tag behaviour).
+    pub fn project_is_urgent(&self, id: ProjectId) -> bool {
+        self.agents.iter().any(|(aid, rec)| {
+            self.project_of.get(aid) == Some(&id)
+                && (rec.blocked_since.is_some() || rec.meta.urgent)
+        })
     }
 
     pub fn record(&self, id: AgentId) -> Option<&AgentRecord> {
@@ -264,6 +483,22 @@ impl Registry {
         }
     }
 
+    /// Re-arm a restored pane for a freshly-attached live process: drop the stale
+    /// approval/urgent state (the old process that owned it is gone) and lift a
+    /// terminal state back to Idle, so the state machine stops swallowing events
+    /// and the resumed process's output flows into this pane again.
+    pub fn reactivate(&mut self, id: AgentId) {
+        if let Some(rec) = self.agents.get_mut(&id) {
+            if rec.state.is_terminal() {
+                rec.state = AgentState::Idle;
+            }
+            rec.pending = None;
+            rec.blocked_since = None;
+            rec.meta.urgent = false;
+            rec.streaming = false;
+        }
+    }
+
     pub fn pending_request_id(&self, id: AgentId) -> Option<String> {
         self.agents
             .get(&id)?
@@ -272,18 +507,20 @@ impl Registry {
             .map(|c| c.request_id.clone())
     }
 
-    /// Move focus to the next/previous agent in roster order (wraps).
+    /// Move focus to the next/previous agent in the active project's roster
+    /// order (wraps). No-op if the active project is empty.
     pub fn focus_step(&mut self, delta: isize) {
-        if self.order.is_empty() {
+        let ord = self.active_order();
+        if ord.is_empty() {
             return;
         }
         let cur = self
-            .focus
-            .and_then(|f| self.order.iter().position(|i| *i == f))
+            .focus()
+            .and_then(|f| ord.iter().position(|i| *i == f))
             .unwrap_or(0) as isize;
-        let len = self.order.len() as isize;
+        let len = ord.len() as isize;
         let next = ((cur + delta) % len + len) % len;
-        self.focus = Some(self.order[next as usize]);
+        self.focus_by_project.insert(self.active, ord[next as usize]);
     }
 
     /// Toggle tag slot `n` (1-based) on an agent.
@@ -300,6 +537,85 @@ impl Registry {
 
     pub fn is_empty(&self) -> bool {
         self.agents.is_empty()
+    }
+
+    // ---- Persistence --------------------------------------------------------
+
+    /// Capture the whole session (projects + every agent pane) for saving to
+    /// disk. Live-only state (blocked_since/pending/streaming) is intentionally
+    /// dropped — a restored pane is history until re-attached to a process.
+    pub fn snapshot(&self) -> crate::session::SessionState {
+        let agents = self
+            .order
+            .iter()
+            .filter_map(|id| {
+                let rec = self.agents.get(id)?;
+                let project_id = *self.project_of.get(id)?;
+                Some(crate::session::AgentSnapshot {
+                    project_id,
+                    meta: rec.meta.clone(),
+                    state: rec.state,
+                    info: rec.info.clone(),
+                    tokens: rec.tokens,
+                    tail: rec.tail.iter().cloned().collect(),
+                    // The Claude session id (from `init`) — the key for live resume.
+                    session_id: rec.info.as_ref().and_then(|i| i.session_id.clone()),
+                    is_subagent: rec.meta.name.starts_with('\u{21b3}'),
+                    resumable: rec.resumable,
+                })
+            })
+            .collect();
+        crate::session::SessionState {
+            version: crate::session::SCHEMA_VERSION,
+            projects: self.projects.clone(),
+            active: self.active,
+            agents,
+        }
+    }
+
+    /// Rebuild this registry from a saved [`crate::session::SessionState`],
+    /// replacing all current contents. Restored agents are Idle-of-record (their
+    /// saved `state`) with no live process; id/project counters are advanced past
+    /// everything restored so freshly spawned agents/projects never collide.
+    pub fn restore(&mut self, state: &crate::session::SessionState) {
+        self.agents.clear();
+        self.order.clear();
+        self.project_of.clear();
+        self.focus_by_project.clear();
+        self.projects = state.projects.clone();
+        self.active = state.active;
+        self.clock = 0;
+        self.next_project_id = state
+            .projects
+            .iter()
+            .map(|p| p.id.0 + 1)
+            .max()
+            .unwrap_or(0);
+
+        let mut next_id = 0u32;
+        for snap in &state.agents {
+            let id = snap.meta.id;
+            next_id = next_id.max(id.0 + 1);
+            let mut rec = Self::fresh(snap.meta.clone());
+            rec.state = snap.state;
+            rec.tokens = snap.tokens;
+            rec.info = snap.info.clone();
+            rec.tail = snap.tail.iter().cloned().collect();
+            rec.resumable = snap.resumable;
+            self.agents.insert(id, rec);
+            self.order.push(id);
+            self.project_of.insert(id, snap.project_id);
+            self.focus_by_project.entry(snap.project_id).or_insert(id);
+        }
+        self.next_id = next_id;
+
+        // Guarantee at least one project and a valid active pointer.
+        if self.projects.is_empty() {
+            let id = self.add_project("main", PathBuf::new());
+            self.active = id;
+        } else if !self.projects.iter().any(|p| p.id == self.active) {
+            self.active = self.projects[0].id;
+        }
     }
 }
 

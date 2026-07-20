@@ -115,7 +115,64 @@ impl Engine {
         let mut meta = AgentMeta::new(id, name, spec.cwd.clone(), 0);
         meta.tags = tags;
         self.reg.add(meta);
+        // Agents that run the control-channel handshake are real Claude sessions —
+        // the only ones `claude --resume` can bring back. Mocks are not resumable.
+        self.reg.set_resumable(id, handshake);
+        self.attach(id, spec, prompt, handshake, persistent)?;
+        Ok(id)
+    }
 
+    /// Re-attach a LIVE process to an already-restored pane. Unlike [`Engine::spawn`]
+    /// this allocates no id and adds no record — the pane already exists (from
+    /// [`crate::Registry::restore`]). Used by session restore to bring a persisted
+    /// agent back with `claude --resume <session_id>` while keeping its restored
+    /// transcript. The pane is first reactivated so the state machine accepts the
+    /// resumed process's events; new output appends to the same tail.
+    pub fn resume_agent(
+        &mut self,
+        id: AgentId,
+        spec: CommandSpec,
+        prompt: Option<String>,
+        handshake: bool,
+        persistent: bool,
+    ) -> std::io::Result<()> {
+        self.reg.reactivate(id);
+        self.attach(id, spec, prompt, handshake, persistent)
+    }
+
+    /// Whether a live process is currently attached to `id` (so callers can avoid
+    /// double-resuming an already-live pane).
+    pub fn is_live(&self, id: AgentId) -> bool {
+        self.answerers.contains_key(&id)
+    }
+
+    /// Close the active project (screen): terminate its agents' processes and drop
+    /// their panes. With more than one screen the project is removed and the active
+    /// one switches to a neighbour; on the SOLE remaining screen the project is kept
+    /// but emptied (there is always at least one screen). Always takes effect.
+    pub fn close_active_project(&mut self) -> bool {
+        let pid = self.reg.active();
+        for id in self.reg.agents_in(pid) {
+            self.kill(id); // SIGTERM the process (no-op for sub-agent panes)
+        }
+        if self.reg.projects().len() > 1 {
+            self.reg.remove_project(pid)
+        } else {
+            self.reg.clear_project(pid); // last screen — empty it in place
+            true
+        }
+    }
+
+    /// Start a process for `spec`, wire its answerer/pid, and spawn the reader
+    /// thread that forwards its events tagged with `id`. Shared by spawn/resume.
+    fn attach(
+        &mut self,
+        id: AgentId,
+        spec: CommandSpec,
+        prompt: Option<String>,
+        handshake: bool,
+        persistent: bool,
+    ) -> std::io::Result<()> {
         let mut runner = StreamJsonRunner::spawn(&spec)?;
         if handshake {
             runner.send_initialize()?;
@@ -186,7 +243,7 @@ impl Engine {
             });
         });
         self.readers.push(handle);
-        Ok(id)
+        Ok(())
     }
 
     /// Drain all currently-ready events into the registry. Returns how many.

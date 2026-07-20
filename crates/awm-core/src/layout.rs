@@ -25,7 +25,7 @@ pub fn plan_layout(reg: &Registry, mode: LayoutMode) -> LayoutCmd {
     let blocked = reg.blocked_ordered();
 
     match mode {
-        LayoutMode::Monocle => match reg.focus().or_else(|| reg.order().first().copied()) {
+        LayoutMode::Monocle => match reg.focus().or_else(|| reg.active_order().first().copied()) {
             Some(id) => LayoutCmd::Monocle(id),
             None => LayoutCmd::Stack(Vec::new()),
         },
@@ -39,7 +39,7 @@ pub fn plan_layout(reg: &Registry, mode: LayoutMode) -> LayoutCmd {
                 .first()
                 .copied()
                 .or_else(|| reg.focus())
-                .or_else(|| reg.order().first().copied());
+                .or_else(|| reg.active_order().first().copied());
             match master {
                 Some(id) => LayoutCmd::SetMaster(id),
                 None => LayoutCmd::Stack(Vec::new()),

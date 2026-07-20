@@ -13,10 +13,18 @@ pub enum Action {
     ZoomMaster,
     /// `Mod+m` — toggle monocle (full-screen) layout.
     ToggleMonocle,
-    /// `Mod+1..9` — toggle tag `n` (1-based) on the focused agent.
-    ToggleTag(u8),
+    /// `Mod+1..9` — switch to project (screen) `n` (1-based). NOTE: many
+    /// terminals do not encode Ctrl+digit distinctly; [`Action::NextProject`] is
+    /// the reliable, terminal-friendly alternative.
+    SwitchProject(u8),
+    /// `Mod+o` — cycle to the next project (screen), wrapping.
+    NextProject,
     /// `Mod+p` — open the spawn prompt.
     SpawnPrompt,
+    /// `Mod+n` — create a new project (screen).
+    NewProject,
+    /// `Mod+w` — close the active project (screen) and its agents.
+    CloseProject,
     /// `y` / `n` on an urgent agent — approve / deny the pending request.
     Approve,
     Deny,
@@ -50,7 +58,10 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Enter if ctrl => Some(Action::ZoomMaster),
         KeyCode::Char('m') if ctrl => Some(Action::ToggleMonocle),
         KeyCode::Char('p') if ctrl => Some(Action::SpawnPrompt),
-        KeyCode::Char(c @ '1'..='9') if ctrl => Some(Action::ToggleTag(c as u8 - b'0')),
+        KeyCode::Char('n') if ctrl => Some(Action::NewProject),
+        KeyCode::Char('o') if ctrl => Some(Action::NextProject),
+        KeyCode::Char('w') if ctrl => Some(Action::CloseProject),
+        KeyCode::Char(c @ '1'..='9') if ctrl => Some(Action::SwitchProject(c as u8 - b'0')),
 
         // Bare approval keys (meaningful on an urgent, focused agent).
         KeyCode::Char('y') if !ctrl => Some(Action::Approve),
@@ -104,15 +115,30 @@ mod tests {
     }
 
     #[test]
-    fn mod_tag_digits() {
+    fn mod_digits_switch_project() {
         for n in 1..=9u8 {
             let c = (b'0' + n) as char;
             assert_eq!(
                 map_key(ctrl(KeyCode::Char(c))),
-                Some(Action::ToggleTag(n)),
-                "Mod+{c} should toggle tag {n}"
+                Some(Action::SwitchProject(n)),
+                "Mod+{c} should switch to project {n}"
             );
         }
+    }
+
+    #[test]
+    fn mod_n_new_project() {
+        assert_eq!(map_key(ctrl(KeyCode::Char('n'))), Some(Action::NewProject));
+    }
+
+    #[test]
+    fn mod_o_next_project() {
+        assert_eq!(map_key(ctrl(KeyCode::Char('o'))), Some(Action::NextProject));
+    }
+
+    #[test]
+    fn mod_w_close_project() {
+        assert_eq!(map_key(ctrl(KeyCode::Char('w'))), Some(Action::CloseProject));
     }
 
     #[test]

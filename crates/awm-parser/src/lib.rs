@@ -177,6 +177,10 @@ impl StreamParser {
                 plugins: string_array(value, "plugins"),
                 slash_commands: string_array(value, "slash_commands"),
                 agents: string_array(value, "agents"),
+                session_id: value
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             }));
             self.emit(AgentEvent::Started { model, cwd });
         } else {
@@ -518,7 +522,7 @@ mod tests {
     #[test]
     fn init_emits_info_with_metadata_then_started() {
         let mut p = StreamParser::new();
-        p.feed(br#"{"type":"system","subtype":"init","cwd":"/home/dev/proj","model":"claude-opus-4-8","permissionMode":"acceptEdits","tools":["Bash","Read","Edit"],"skills":["deep-research","dataviz"],"plugins":["p1"],"slash_commands":["/review","/test"],"agents":["Explore","Plan"]}
+        p.feed(br#"{"type":"system","subtype":"init","cwd":"/home/dev/proj","session_id":"sess-abc","model":"claude-opus-4-8","permissionMode":"acceptEdits","tools":["Bash","Read","Edit"],"skills":["deep-research","dataviz"],"plugins":["p1"],"slash_commands":["/review","/test"],"agents":["Explore","Plan"]}
 "#);
         let events: Vec<_> = std::iter::from_fn(|| p.next_event()).collect();
         assert!(events.contains(&AgentEvent::Info(AgentInfo {
@@ -529,6 +533,7 @@ mod tests {
             plugins: vec!["p1".into()],
             slash_commands: vec!["/review".into(), "/test".into()],
             agents: vec!["Explore".into(), "Plan".into()],
+            session_id: Some("sess-abc".into()),
         })));
         // Started is still emitted (Info does not replace it).
         assert!(events.contains(&AgentEvent::Started {
@@ -551,6 +556,7 @@ mod tests {
             plugins: vec![],
             slash_commands: vec![],
             agents: vec![],
+            session_id: None,
         })));
     }
 

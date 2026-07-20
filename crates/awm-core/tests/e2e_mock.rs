@@ -4,9 +4,11 @@
 //! oldest is promoted to master, we answer over the control channel, and they
 //! resume to Done. Also proves the reader-thread/answerer split doesn't deadlock.
 
-use awm_core::{plan_layout, Engine, LayoutMode};
+use awm_core::{plan_layout, AgentSnapshot, Engine, LayoutMode, Project, ProjectId, SessionState};
 use awm_pty::{CommandSpec, Decision};
-use awm_proto::{AgentId, AgentState, LayoutCmd, LineKind, Tags};
+use awm_proto::{
+    AgentId, AgentMeta, AgentState, LayoutCmd, LineKind, TokenUsage, TranscriptLine, Tags,
+};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -360,6 +362,68 @@ fn subagent_gates_route_to_child_panes_not_root() {
         engine.registry().pending_request_id(subs[1]).is_some(),
         "answering one sub-agent must not resolve the other"
     );
+
+    engine.shutdown();
+    engine.join();
+}
+
+/// Session restore + LIVE re-attach: a persisted pane (terminal, with saved
+/// transcript) is restored, then a fresh process is attached to the SAME agent
+/// id via `resume_agent`. The pane must reactivate (stop being terminal) and the
+/// resumed process's output must APPEND to the preserved transcript. This mirrors
+/// `claude --resume` with a mock standing in for claude (tests never run claude).
+#[test]
+fn restore_then_resume_attaches_live_process_to_existing_pane() {
+    let id = AgentId(7);
+    let state = SessionState {
+        version: 1,
+        projects: vec![Project {
+            id: ProjectId(0),
+            name: "proj".into(),
+            cwd: "/tmp".into(),
+        }],
+        active: ProjectId(0),
+        agents: vec![AgentSnapshot {
+            project_id: ProjectId(0),
+            meta: AgentMeta::new(id, "revived", "/tmp".into(), 0),
+            state: AgentState::Done, // terminal — reactivate must lift this
+            info: None,
+            tokens: TokenUsage::default(),
+            tail: vec![TranscriptLine::new(LineKind::Text, "OLD HISTORY LINE")],
+            session_id: Some("s-mock".into()),
+            is_subagent: false,
+            resumable: true,
+        }],
+    };
+
+    let mut engine = Engine::new();
+    engine.registry_mut().restore(&state);
+
+    // Restored as dead history: terminal, not live, old line present.
+    assert_eq!(engine.registry().record(id).unwrap().state, AgentState::Done);
+    assert!(!engine.is_live(id));
+
+    // Re-attach a live (mock) process to the SAME pane.
+    engine
+        .resume_agent(id, mock_spec(), None, false, false)
+        .unwrap();
+    assert!(engine.is_live(id), "a live process is now attached");
+
+    // The resumed process's output appends to the pane.
+    let grew = pump_until(&mut engine, |e| {
+        e.registry()
+            .record(id)
+            .map(|r| r.tail.iter().any(|l| l.text.contains("session started")))
+            .unwrap_or(false)
+    });
+    assert!(grew, "resumed output should append to the restored pane");
+
+    let rec = engine.registry().record(id).unwrap();
+    assert!(
+        rec.tail.iter().any(|l| l.text.contains("OLD HISTORY LINE")),
+        "the restored transcript is preserved across resume"
+    );
+    assert_ne!(rec.state, AgentState::Done, "pane reactivated, no longer terminal");
 
     engine.shutdown();
     engine.join();

@@ -170,3 +170,166 @@ fn tail_ring_is_bounded() {
     let n = reg.record(ids[0]).unwrap().tail.len();
     assert!(n <= 400, "tail should be capped, was {n}");
 }
+
+// ---- Projects (screens) -----------------------------------------------------
+
+#[test]
+fn views_and_focus_are_scoped_to_active_project() {
+    let mut reg = Registry::new();
+    let p_default = reg.active();
+
+    // Two agents on the default project.
+    let a0 = reg.alloc_id();
+    reg.add(AgentMeta::new(a0, "a0", "/tmp".into(), 0));
+    let a1 = reg.alloc_id();
+    reg.add(AgentMeta::new(a1, "a1", "/tmp".into(), 0));
+
+    // A second project with one agent.
+    let p_web = reg.add_project("web", "/site".into());
+    reg.set_active(p_web);
+    let b0 = reg.alloc_id();
+    reg.add(AgentMeta::new(b0, "b0", "/site".into(), 0));
+
+    // Active = web → only b0 is visible; focus is web's.
+    assert_eq!(reg.views().iter().map(|v| v.meta.id).collect::<Vec<_>>(), vec![b0]);
+    assert_eq!(reg.focus(), Some(b0));
+    assert_eq!(reg.active_order(), vec![b0]);
+
+    // Switch back to default → a0, a1 visible again; default's focus preserved.
+    reg.set_active(p_default);
+    assert_eq!(reg.views().iter().map(|v| v.meta.id).collect::<Vec<_>>(), vec![a0, a1]);
+    assert_eq!(reg.focus(), Some(a0), "default project kept its own focus");
+}
+
+#[test]
+fn switch_to_is_one_based_and_ignores_out_of_range() {
+    let mut reg = Registry::new(); // project 1 = default
+    let p2 = reg.add_project("two", "/two".into());
+    reg.switch_to(2);
+    assert_eq!(reg.active(), p2);
+    reg.switch_to(9); // no such project
+    assert_eq!(reg.active(), p2, "out-of-range switch is a no-op");
+}
+
+#[test]
+fn blocked_ordered_only_sees_active_project() {
+    let mut reg = Registry::new();
+    let p_default = reg.active();
+    let a = reg.alloc_id();
+    reg.add(AgentMeta::new(a, "a", "/tmp".into(), 0));
+
+    let p_web = reg.add_project("web", "/site".into());
+    reg.set_active(p_web);
+    let b = reg.alloc_id();
+    reg.add(AgentMeta::new(b, "b", "/site".into(), 0));
+
+    // Block the default-project agent while `web` is active.
+    reg.apply_event(a, &AgentEvent::ApprovalRequested(ctx("req_a", "Bash")));
+
+    // web is active → no blocked agent here, but the default tab is urgent.
+    assert!(reg.blocked_ordered().is_empty(), "active project has no block");
+    assert!(reg.project_is_urgent(p_default), "background project flags urgent");
+    assert!(!reg.project_is_urgent(p_web));
+
+    // Switch to default → the block surfaces for triage/answering.
+    reg.set_active(p_default);
+    assert_eq!(reg.blocked_ordered(), vec![a]);
+}
+
+#[test]
+fn urgent_to_master_is_scoped_to_active_project() {
+    let mut reg = Registry::new();
+    let a = reg.alloc_id();
+    reg.add(AgentMeta::new(a, "a", "/tmp".into(), 0));
+    let p_web = reg.add_project("web", "/site".into());
+    reg.set_active(p_web);
+    let b = reg.alloc_id();
+    reg.add(AgentMeta::new(b, "b", "/site".into(), 0));
+
+    // A block on the background (default) agent must NOT hijack web's master zone.
+    reg.apply_event(a, &AgentEvent::ApprovalRequested(ctx("req_a", "Bash")));
+    assert_eq!(plan_layout(&reg, LayoutMode::Tiling), LayoutCmd::SetMaster(b));
+
+    // On the default screen, the blocked agent takes master (urgent → master).
+    reg.set_active(reg.projects()[0].id);
+    assert_eq!(plan_layout(&reg, LayoutMode::Tiling), LayoutCmd::SetMaster(a));
+}
+
+// ---- Persistence (snapshot / restore) ---------------------------------------
+
+#[test]
+fn snapshot_restore_round_trips_projects_panes_and_active() {
+    use awm_core::SessionState;
+
+    let mut reg = Registry::new();
+    let p_default = reg.active();
+    reg.set_project_meta(p_default, "awm", "/home/dev/awm".into());
+
+    // Default project: one agent with some transcript + state.
+    let a = reg.alloc_id();
+    reg.add(AgentMeta::new(a, "builder", "/home/dev/awm".into(), 0));
+    reg.apply_event(a, &AgentEvent::Started { model: "m".into(), cwd: "/home/dev/awm".into() });
+    reg.apply_event(a, &AgentEvent::ToolStarted { name: "Bash".into(), summary: "cargo build".into() });
+
+    // A second project with its own agent, and make it active.
+    let p_web = reg.add_project("web", "/home/dev/web".into());
+    reg.set_active(p_web);
+    let b = reg.alloc_id();
+    reg.add(AgentMeta::new(b, "server", "/home/dev/web".into(), 0));
+
+    // Round-trip through JSON.
+    let json = serde_json::to_string(&reg.snapshot()).unwrap();
+    let state: SessionState = serde_json::from_str(&json).unwrap();
+
+    let mut restored = Registry::new();
+    restored.restore(&state);
+
+    // Projects and active preserved.
+    let names: Vec<&str> = restored.projects().iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["awm", "web"]);
+    assert_eq!(restored.active(), p_web, "active project preserved");
+
+    // Active (web) shows only its agent, with the same id.
+    let web_ids: Vec<AgentId> = restored.views().iter().map(|v| v.meta.id).collect();
+    assert_eq!(web_ids, vec![b]);
+
+    // Switch to the default project: the builder pane + its transcript survived.
+    restored.set_active(p_default);
+    let builder = restored.record(a).unwrap();
+    assert_eq!(builder.meta.name, "builder");
+    assert!(builder.tail.iter().any(|l| l.text.contains("session started")));
+    assert!(builder.tail.iter().any(|l| l.text.contains("Bash")));
+
+    // Fresh ids never collide with restored ones.
+    let c = restored.alloc_id();
+    assert!(c.0 > a.0 && c.0 > b.0, "next id advanced past restored agents");
+}
+
+#[test]
+fn remove_project_drops_its_panes_and_switches_active() {
+    let mut reg = Registry::new();
+    let p_default = reg.active();
+    let a = reg.alloc_id();
+    reg.add(AgentMeta::new(a, "a", "/tmp".into(), 0));
+
+    let p_web = reg.add_project("web", "/site".into());
+    reg.set_active(p_web);
+    let b = reg.alloc_id();
+    reg.add(AgentMeta::new(b, "b", "/site".into(), 0));
+
+    // Close the active (web) project.
+    assert!(reg.remove_project(p_web));
+    assert_eq!(reg.projects().len(), 1, "web project removed");
+    assert_eq!(reg.active(), p_default, "switched to the neighbour");
+    assert!(reg.record(b).is_none(), "web's agent pane dropped");
+    assert_eq!(reg.views().iter().map(|v| v.meta.id).collect::<Vec<_>>(), vec![a]);
+}
+
+#[test]
+fn cannot_close_the_last_project() {
+    let mut reg = Registry::new();
+    let only = reg.active();
+    assert!(!reg.remove_project(only), "the sole screen can't be closed");
+    assert_eq!(reg.projects().len(), 1);
+    assert_eq!(reg.active(), only);
+}

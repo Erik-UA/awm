@@ -30,6 +30,7 @@ dependencies = [
  "awm-tui",
  "crossterm",
  "ratatui",
+ "serde_json",
 ]
 
 [[package]]
@@ -39,6 +40,7 @@ dependencies = [
  "awm-parser",
  "awm-proto",
  "awm-pty",
+ "serde",
  "serde_json",
 ]
 

@@ -17,6 +17,31 @@ use ratatui::{Frame, Terminal};
 
 pub mod keymap;
 
+/// One project (screen) tab shown in the top bar. Built by the binary from the
+/// core's `Registry::projects()` + `active`/`project_is_urgent`; kept here (not in
+/// the frozen `awm-proto`) so the TUI stays self-contained and doesn't depend on
+/// `awm-core`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tab {
+    pub name: String,
+    /// Whether this is the currently-shown project.
+    pub active: bool,
+    /// Whether any agent on this (possibly background) project is blocked/urgent.
+    pub urgent: bool,
+}
+
+/// A snapshot of the directory browser (`Ctrl+n`) for rendering. Built by the
+/// binary from its `Picker` state; kept here (not in proto) like [`Tab`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PickerView {
+    /// The directory currently being browsed (shown as the title).
+    pub path: String,
+    /// Row labels: `../` first (unless at root), then `name/` per subdirectory.
+    pub entries: Vec<String>,
+    /// Index of the highlighted row in `entries`.
+    pub selected: usize,
+}
+
 /// The TUI renderer, generic over a ratatui backend.
 pub struct AwmTui<B: Backend> {
     terminal: Terminal<B>,
@@ -53,20 +78,46 @@ impl<B: Backend> AwmTui<B> {
         prompt: Option<&str>,
         scroll: u16,
         show_card: bool,
+        show_help: bool,
+        picker: Option<&PickerView>,
+        tabs: &[Tab],
     ) -> std::io::Result<()> {
         self.terminal.draw(|frame| {
             let full = frame.size();
+            // Reserve a one-row project tab bar at the very top when there are
+            // projects to show; with no tabs the layout is byte-identical to
+            // before (so `render()`/snapshots are unaffected).
+            let body = if tabs.is_empty() {
+                full
+            } else {
+                let rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(1)])
+                    .split(full);
+                draw_tab_bar(frame, tabs, rows[0]);
+                rows[1]
+            };
             let area = match prompt {
                 Some(text) => {
                     let rows = Layout::default()
                         .direction(Direction::Vertical)
                         .constraints([Constraint::Min(1), Constraint::Length(1)])
-                        .split(full);
+                        .split(body);
                     draw_prompt_bar(frame, text, rows[1]);
                     rows[0]
                 }
-                None => full,
+                None => body,
             };
+            // The directory browser takes over the whole body (highest precedence).
+            if let Some(pv) = picker {
+                render_picker(frame, pv, area);
+                return;
+            }
+            // The help overlay takes over the whole body.
+            if show_help {
+                render_help(frame, area);
+                return;
+            }
             // The inspection card takes over the focused agent's view.
             if show_card {
                 if let Some(v) = focus.and_then(|id| find(views, id)) {
@@ -82,8 +133,166 @@ impl<B: Backend> AwmTui<B> {
 
 impl<B: Backend> Renderer for AwmTui<B> {
     fn render(&mut self, views: &[AgentView], layout: &LayoutCmd) -> std::io::Result<()> {
-        self.draw(views, layout, None, None, 0, false)
+        self.draw(views, layout, None, None, 0, false, false, None, &[])
     }
+}
+
+/// The directory browser overlay (`Ctrl+n`): a bordered panel titled with the
+/// current path, a scrolling list of `../` + subdirectories with the highlighted
+/// row reversed, and a footer legend of the keys. The viewport follows the
+/// selection so it is always visible in long directories.
+fn render_picker(frame: &mut Frame, view: &PickerView, area: Rect) {
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let title = elide_left(&view.path, inner_w.saturating_sub(2));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {title} "));
+    frame.render_widget(&block, area);
+    let inner = block.inner(area);
+    if inner.height == 0 {
+        return;
+    }
+
+    // Reserve the last inner row for the key legend.
+    let list_h = inner.height.saturating_sub(1).max(1) as usize;
+    // Scroll so `selected` stays inside the visible window.
+    let start = view.selected.saturating_sub(list_h.saturating_sub(1)).min(
+        view.entries.len().saturating_sub(list_h),
+    );
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, label) in view.entries.iter().enumerate().skip(start).take(list_h) {
+        let style = if i == view.selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else if label == "../" {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let marker = if i == view.selected { "> " } else { "  " };
+        lines.push(Line::from(Span::styled(format!("{marker}{label}"), style)));
+    }
+    // Pad to fill, then the legend on the last row.
+    while lines.len() < list_h {
+        lines.push(Line::from(String::new()));
+    }
+    lines.push(Line::from(Span::styled(
+        "↑↓ move · Enter open · ⌫ up · s select this folder · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Left-elide a path to at most `w` columns, prefixing `…` when truncated.
+fn elide_left(s: &str, w: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= w || w == 0 {
+        return s.to_string();
+    }
+    let tail: String = chars[chars.len() - (w - 1)..].iter().collect();
+    format!("…{tail}")
+}
+
+/// The keybinding help overlay (toggled by `?`). A bordered panel grouping the
+/// bindings by area. Kept in sync with `keymap::map_key` and the binary's direct
+/// keys (`i`/`r`/`q`, Ctrl+x/t).
+fn render_help(frame: &mut Frame, area: Rect) {
+    let key = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let head = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+
+    let mut body: Vec<Line> = Vec::new();
+    let section = |body: &mut Vec<Line>, title: &str, rows: &[(&str, &str)]| {
+        body.push(Line::from(Span::styled(title.to_string(), head)));
+        for (k, desc) in rows {
+            body.push(Line::from(vec![
+                Span::styled(format!("  {k:<12}"), key),
+                Span::raw((*desc).to_string()),
+            ]));
+        }
+        body.push(Line::from(String::new()));
+    };
+
+    section(
+        &mut body,
+        "Screens (projects)",
+        &[
+            ("Ctrl+n", "new project (folder browser)"),
+            ("Ctrl+w", "close active project (empties the last one)"),
+            ("Ctrl+o", "next project (wraps)"),
+            ("Ctrl+1..9", "switch to project N (if terminal sends it)"),
+        ],
+    );
+    section(
+        &mut body,
+        "Agents",
+        &[
+            ("Ctrl+p", "spawn an agent on this screen"),
+            ("i", "message the focused agent"),
+            ("r", "resume a restored (dead) claude pane"),
+            ("Ctrl+x", "kill the focused agent"),
+        ],
+    );
+    section(
+        &mut body,
+        "Focus & layout",
+        &[
+            ("Ctrl+j / k", "focus next / previous pane"),
+            ("Ctrl+Enter", "zoom focused pane to master"),
+            ("Ctrl+m", "toggle monocle (full-screen)"),
+            ("Ctrl+t", "toggle approval triage"),
+            ("Tab", "toggle the agent inspect card"),
+            ("Shift+Tab", "cycle permission mode"),
+            ("PgUp/PgDn", "scroll (Home/End = top/bottom)"),
+        ],
+    );
+    section(
+        &mut body,
+        "Approvals & app",
+        &[
+            ("y / n", "approve / deny the blocked agent"),
+            ("e", "expand the blocked agent to answer"),
+            ("?", "toggle this help"),
+            ("q", "quit (saves the session)"),
+        ],
+    );
+    body.push(Line::from(Span::styled(
+        "press ? or Esc to close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" awm — keybindings ");
+    frame.render_widget(Paragraph::new(body).block(block), area);
+}
+
+/// The top project tab bar: `[1:awm] [2:web !] [3:docs]`. The active project is
+/// bold + reversed; any project with a blocked/urgent agent shows a red `!` (so
+/// the cross-screen urgent signal is visible even in a symbol-only snapshot).
+fn draw_tab_bar(frame: &mut Frame, tabs: &[Tab], area: Rect) {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, tab) in tabs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let mark = if tab.urgent { " !" } else { "" };
+        let label = format!("[{}:{}{}]", i + 1, tab.name, mark);
+        let mut style = if tab.active {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        if tab.urgent {
+            style = style.fg(Color::Red).add_modifier(Modifier::BOLD);
+        }
+        spans.push(Span::styled(label, style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Dispatch a layout command into `area`, optionally marking the focused agent.
@@ -864,6 +1073,7 @@ mod tests {
                 plugins: vec!["plug-a".into(), "plug-b".into()],
                 slash_commands: vec!["/review".into(), "/test".into(), "/deploy".into()],
                 agents: vec!["Explore".into(), "Plan".into()],
+                session_id: None,
             }),
             tail: vec![],
         }
@@ -900,6 +1110,9 @@ mod tests {
             None,
             0,
             true,
+            false,
+            None,
+            &[],
         )
         .unwrap();
         insta::assert_snapshot!("card_populated", buffer_to_string(tui.backend()));
@@ -917,6 +1130,9 @@ mod tests {
             None,
             0,
             true,
+            false,
+            None,
+            &[],
         )
         .unwrap();
         assert!(buffer_to_string(tui.backend()).contains("no metadata yet"));

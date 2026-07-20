@@ -118,3 +118,20 @@ fn subagent_approval() {
 fn garbage_is_robust() {
     run_fixture("garbage");
 }
+
+/// The `init` line's `session_id` is surfaced on `AgentInfo` — the key the
+/// runtime later uses to resume a persisted session (`claude --resume <id>`).
+#[test]
+fn session_id_is_extracted_from_init() {
+    let bytes = fs::read(fixtures_dir().join("normal.jsonl")).unwrap();
+    let mut parser = StreamParser::new();
+    parser.feed(&bytes);
+
+    let mut session_id = None;
+    while let Some(ev) = parser.next_event() {
+        if let AgentEvent::Info(info) = ev {
+            session_id = info.session_id.clone();
+        }
+    }
+    assert_eq!(session_id.as_deref(), Some("s-normal"), "session_id from init");
+}

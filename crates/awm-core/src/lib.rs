@@ -8,7 +8,9 @@
 pub mod layout;
 pub mod registry;
 pub mod runtime;
+pub mod session;
 
 pub use layout::{plan_layout, LayoutMode};
-pub use registry::{AgentRecord, Registry};
+pub use registry::{AgentRecord, Project, ProjectId, Registry};
 pub use runtime::{CoreEvent, Engine};
+pub use session::{AgentSnapshot, SessionState};
