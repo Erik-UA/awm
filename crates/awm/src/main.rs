@@ -1019,6 +1019,11 @@ fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
                         _ => {}
                     }
                 } else {
+                    // Layout-independent hotkeys: when a Cyrillic layout is
+                    // active, map the char back to its QWERTY-position Latin
+                    // key (Ctrl+о → Ctrl+j, etc.). The picker filter and text
+                    // input branches above keep the real char for typing.
+                    let key = awm_tui::keymap::normalize_layout(key);
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                     // Direct keys not covered by the shared keymap.
                     match key.code {

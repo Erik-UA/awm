@@ -85,6 +85,47 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
     }
 }
 
+/// The Latin letter on the same physical key as the Cyrillic character `c`, for
+/// the built-in layouts (Russian ЙЦУКЕН + Ukrainian — their letter positions
+/// coincide). `None` if `c` is not a covered Cyrillic letter. The result is
+/// lowercase (hotkeys are lowercase Latin); uppercase input (`О`) is folded
+/// first so caps/shift still resolve.
+///
+/// crossterm reports the layout-dependent character, not the physical key (its
+/// Kitty parser discards the base-layout-key field), so this table is how a
+/// Cyrillic-layout keypress is mapped back to its QWERTY hotkey. Adding another
+/// layout is a few more match arms; Cyrillic/Latin codepoint ranges are
+/// disjoint, so the arms compose without collisions.
+#[must_use]
+pub fn positional_latin(c: char) -> Option<char> {
+    let lower = c.to_lowercase().next().unwrap_or(c);
+    Some(match lower {
+        // Russian ЙЦУКЕН → QWERTY (full a–z, so future hotkeys work too).
+        'й' => 'q', 'ц' => 'w', 'у' => 'e', 'к' => 'r', 'е' => 't', 'н' => 'y',
+        'г' => 'u', 'ш' => 'i', 'щ' => 'o', 'з' => 'p', 'ф' => 'a', 'ы' => 's',
+        'в' => 'd', 'а' => 'f', 'п' => 'g', 'р' => 'h', 'о' => 'j', 'л' => 'k',
+        'д' => 'l', 'я' => 'z', 'ч' => 'x', 'с' => 'c', 'м' => 'v', 'и' => 'b',
+        'т' => 'n', 'ь' => 'm',
+        // Ukrainian differs only on non-hotkey keys; і shares the `s` position
+        // with Russian ы (distinct codepoints, both safe to map).
+        'і' => 's',
+        _ => return None,
+    })
+}
+
+/// Rewrite a keypress to its QWERTY-position Latin equivalent when a Cyrillic
+/// layout is active, preserving modifiers. Non-letters and Latin pass through
+/// unchanged. Apply this only in command mode — text entry needs the real char.
+#[must_use]
+pub fn normalize_layout(mut key: KeyEvent) -> KeyEvent {
+    if let KeyCode::Char(c) = key.code {
+        if let Some(latin) = positional_latin(c) {
+            key.code = KeyCode::Char(latin);
+        }
+    }
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +205,38 @@ mod tests {
         assert_eq!(map_key(bare(KeyCode::Char('0'))), None);
         assert_eq!(map_key(ctrl(KeyCode::Char('0'))), None);
         assert_eq!(map_key(bare(KeyCode::Esc)), None);
+    }
+
+    #[test]
+    fn positional_latin_maps_cyrillic_by_key_position() {
+        assert_eq!(positional_latin('о'), Some('j')); // physical j
+        assert_eq!(positional_latin('к'), Some('r')); // physical r
+        assert_eq!(positional_latin('і'), Some('s')); // Ukrainian s
+        assert_eq!(positional_latin('О'), Some('j')); // uppercase folds
+        // Latin and non-letters are left alone.
+        assert_eq!(positional_latin('j'), None);
+        assert_eq!(positional_latin('1'), None);
+    }
+
+    #[test]
+    fn cyrillic_hotkeys_resolve_via_normalization() {
+        // Ctrl+о (physical Ctrl+j) → focus next, once normalized.
+        assert_eq!(map_key(normalize_layout(ctrl(KeyCode::Char('о')))), Some(Action::FocusNext));
+        // Bare н (physical y) → approve.
+        assert_eq!(map_key(normalize_layout(bare(KeyCode::Char('н')))), Some(Action::Approve));
+    }
+
+    #[test]
+    fn normalization_preserves_modifiers() {
+        // physical `n` is overloaded: Ctrl → NewProject, bare → Deny. The
+        // modifier must survive translation so both still resolve.
+        assert_eq!(map_key(normalize_layout(ctrl(KeyCode::Char('т')))), Some(Action::NewProject));
+        assert_eq!(map_key(normalize_layout(bare(KeyCode::Char('т')))), Some(Action::Deny));
+    }
+
+    #[test]
+    fn normalization_leaves_latin_and_nonletters_untouched() {
+        assert_eq!(normalize_layout(ctrl(KeyCode::Char('j'))), ctrl(KeyCode::Char('j')));
+        assert_eq!(normalize_layout(bare(KeyCode::Enter)), bare(KeyCode::Enter));
     }
 }
