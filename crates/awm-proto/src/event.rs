@@ -33,8 +33,16 @@ pub enum AgentEvent {
     /// replaces the accumulated chunks.
     MessageDelta { text: String },
     /// The agent began invoking a tool. `summary` is a one-line preview of the
-    /// tool input (e.g. the Bash command, or an edited file's path).
-    ToolStarted { name: String, summary: String },
+    /// tool input (e.g. the Bash command, or an edited file's path). `input` is
+    /// the proposed tool input, kept opaque (like [`ApprovalCtx::input`]) so the
+    /// core can render an edit diff for `Edit`/`Write`/`MultiEdit` without new
+    /// proto types. `None` for non-edit tools and older snapshots.
+    ToolStarted {
+        name: String,
+        summary: String,
+        #[serde(default)]
+        input: Option<serde_json::Value>,
+    },
     /// The result of a tool call (its output text and whether it errored) — the
     /// content shown under the `⎿` branch in the window.
     ToolResult { output: String, is_error: bool },

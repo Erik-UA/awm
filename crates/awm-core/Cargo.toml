@@ -11,6 +11,4 @@ awm-proto = { workspace = true }
 awm-pty = { workspace = true }
 awm-parser = { workspace = true }
 serde = { workspace = true }
-
-[dev-dependencies]
 serde_json = { workspace = true }

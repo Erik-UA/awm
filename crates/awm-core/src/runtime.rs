@@ -452,6 +452,7 @@ mod tests {
             event: AgentEvent::ToolStarted {
                 name: name.into(),
                 summary: String::new(),
+                input: None,
             },
             parent_tool_use_id: parent.map(str::to_string),
             tool_use_id: Some(tool_use_id.to_string()),
@@ -504,6 +505,7 @@ mod tests {
             AgentEvent::ToolStarted {
                 name: "Task".into(),
                 summary: "find handlers".into(),
+                input: None,
             },
             None,
             Some(Spawn {
@@ -567,6 +569,7 @@ mod tests {
         let tool = || AgentEvent::ToolStarted {
             name: "Task".into(),
             summary: "scan".into(),
+            input: None,
         };
         engine.route(ev(root, tool(), None, spawn()));
         engine.route(ev(root, tool(), None, spawn()));
@@ -585,7 +588,7 @@ mod tests {
 
         engine.route(ev(
             root,
-            AgentEvent::ToolStarted { name: "Agent".into(), summary: "bg".into() },
+            AgentEvent::ToolStarted { name: "Agent".into(), summary: "bg".into(), input: None },
             None,
             Some(Spawn { tool_use_id: "toolu_1".into(), description: "bg".into() }),
         ));
@@ -621,7 +624,7 @@ mod tests {
         for (tid, desc) in [("toolu_a1", "run parser tests"), ("toolu_a2", "run core tests")] {
             engine.route(ev(
                 root,
-                AgentEvent::ToolStarted { name: "Agent".into(), summary: desc.into() },
+                AgentEvent::ToolStarted { name: "Agent".into(), summary: desc.into(), input: None },
                 None,
                 Some(Spawn { tool_use_id: tid.into(), description: desc.into() }),
             ));

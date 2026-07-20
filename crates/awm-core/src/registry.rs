@@ -30,6 +30,8 @@ pub struct Project {
 const TAIL_CAP: usize = 400;
 /// Cap on how many lines of a single tool result to show (Claude-style).
 const TOOL_RESULT_LINES: usize = 8;
+/// Cap on how many diff lines to show under an edit tool call.
+const DIFF_LINES: usize = 12;
 
 /// Everything the core tracks for one agent.
 pub struct AgentRecord {
@@ -638,13 +640,17 @@ fn transcript_lines(event: &AgentEvent) -> Vec<TranscriptLine> {
                 vec![TranscriptLine::new(K::Text, t)]
             }
         }
-        AgentEvent::ToolStarted { name, summary } => {
+        AgentEvent::ToolStarted { name, summary, input } => {
             let text = if summary.is_empty() {
                 format!("⏺ {name}")
             } else {
                 format!("⏺ {name}({summary})")
             };
-            vec![TranscriptLine::new(K::ToolCall, text)]
+            let mut out = vec![TranscriptLine::new(K::ToolCall, text)];
+            if let Some(input) = input {
+                out.extend(diff_lines(name, input));
+            }
+            out
         }
         AgentEvent::ToolResult { output, is_error } => {
             let kind = if *is_error { K::ToolError } else { K::ToolResult };
@@ -693,5 +699,162 @@ fn transcript_lines(event: &AgentEvent) -> Vec<TranscriptLine> {
             if *ok { "● done" } else { "● failed" },
         )],
         _ => Vec::new(),
+    }
+}
+
+/// Build red `-` / green `+` diff lines under an edit tool call, capped at
+/// [`DIFF_LINES`]. Reuses existing `LineKind`s for color (`ToolError` = red for
+/// removals, `ToolCall` = green for additions), so no new proto type or TUI
+/// change is needed. Returns nothing when there is no textual change.
+fn diff_lines(name: &str, input: &serde_json::Value) -> Vec<TranscriptLine> {
+    let field = |k: &str| input.get(k).and_then(serde_json::Value::as_str).unwrap_or("");
+    // (added?, text) for each changed line, removals before additions.
+    let mut signed: Vec<(bool, String)> = Vec::new();
+    match name {
+        // A new/overwritten file: the whole body is an addition.
+        "Write" => push_change(&mut signed, "", field("content")),
+        "NotebookEdit" => push_change(&mut signed, "", field("new_source")),
+        "MultiEdit" => {
+            if let Some(edits) = input.get("edits").and_then(serde_json::Value::as_array) {
+                for e in edits {
+                    let old = e.get("old_string").and_then(serde_json::Value::as_str).unwrap_or("");
+                    let new = e.get("new_string").and_then(serde_json::Value::as_str).unwrap_or("");
+                    push_change(&mut signed, old, new);
+                }
+            }
+        }
+        // Edit (and any other edit-family tool): old → new.
+        _ => push_change(&mut signed, field("old_string"), field("new_string")),
+    }
+
+    let total = signed.len();
+    let mut out: Vec<TranscriptLine> = signed
+        .into_iter()
+        .take(DIFF_LINES)
+        .map(|(added, line)| {
+            let (kind, sign) = if added {
+                (LineKind::ToolCall, '+')
+            } else {
+                (LineKind::ToolError, '-')
+            };
+            TranscriptLine::new(kind, format!("  {sign} {line}"))
+        })
+        .collect();
+    let extra = total.saturating_sub(DIFF_LINES);
+    if extra > 0 {
+        out.push(TranscriptLine::new(LineKind::ToolResult, format!("  … +{extra} lines")));
+    }
+    out
+}
+
+/// Append signed diff lines for one `old` → `new` change, trimming the common
+/// leading and trailing identical lines so only the changed middle is shown.
+/// Removed lines are pushed first (`false`), then added lines (`true`).
+fn push_change(out: &mut Vec<(bool, String)>, old: &str, new: &str) {
+    let a: Vec<&str> = if old.is_empty() { Vec::new() } else { old.lines().collect() };
+    let b: Vec<&str> = if new.is_empty() { Vec::new() } else { new.lines().collect() };
+
+    // Common prefix, then common suffix (not overlapping the prefix).
+    let mut start = 0;
+    while start < a.len() && start < b.len() && a[start] == b[start] {
+        start += 1;
+    }
+    let mut end = 0;
+    while end < a.len() - start
+        && end < b.len() - start
+        && a[a.len() - 1 - end] == b[b.len() - 1 - end]
+    {
+        end += 1;
+    }
+
+    for l in &a[start..a.len() - end] {
+        out.push((false, (*l).to_string()));
+    }
+    for l in &b[start..b.len() - end] {
+        out.push((true, (*l).to_string()));
+    }
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Turn an `Edit`/`Write` event into its transcript lines.
+    fn lines(name: &str, summary: &str, input: serde_json::Value) -> Vec<TranscriptLine> {
+        transcript_lines(&AgentEvent::ToolStarted {
+            name: name.into(),
+            summary: summary.into(),
+            input: Some(input),
+        })
+    }
+
+    #[test]
+    fn edit_shows_only_the_changed_middle_in_red_and_green() {
+        let out = lines(
+            "Edit",
+            "f.rs",
+            json!({ "file_path": "f.rs", "old_string": "a\nb\nc", "new_string": "a\nX\nc" }),
+        );
+        // Header first, unchanged surrounding lines (a, c) trimmed away.
+        assert_eq!(out[0].kind, LineKind::ToolCall);
+        assert_eq!(out[0].text, "⏺ Edit(f.rs)");
+        let removed = out.iter().find(|l| l.kind == LineKind::ToolError).unwrap();
+        assert_eq!(removed.text, "  - b");
+        let added = out
+            .iter()
+            .find(|l| l.kind == LineKind::ToolCall && l.text.contains('+'))
+            .unwrap();
+        assert_eq!(added.text, "  + X");
+        // Common lines `a`/`c` are trimmed: exactly one removal + one addition.
+        assert_eq!(out.iter().filter(|l| l.text.starts_with("  - ")).count(), 1);
+        assert_eq!(out.iter().filter(|l| l.text.starts_with("  + ")).count(), 1);
+    }
+
+    #[test]
+    fn write_shows_whole_body_as_additions() {
+        let out = lines("Write", "n.rs", json!({ "file_path": "n.rs", "content": "l1\nl2" }));
+        let adds: Vec<_> = out
+            .iter()
+            .filter(|l| l.kind == LineKind::ToolCall && l.text.contains('+'))
+            .collect();
+        assert_eq!(adds.len(), 2);
+        assert_eq!(adds[0].text, "  + l1");
+        assert_eq!(adds[1].text, "  + l2");
+    }
+
+    #[test]
+    fn long_diff_is_capped_with_a_tail() {
+        let content: String = (0..30).map(|i| format!("line{i}\n")).collect();
+        let out = lines("Write", "big.rs", json!({ "file_path": "big.rs", "content": content }));
+        let shown = out.iter().filter(|l| l.text.starts_with("  + ")).count();
+        assert_eq!(shown, DIFF_LINES);
+        let tail = out.last().unwrap();
+        assert_eq!(tail.kind, LineKind::ToolResult);
+        assert_eq!(tail.text, format!("  … +{} lines", 30 - DIFF_LINES));
+    }
+
+    #[test]
+    fn multiedit_concatenates_each_change() {
+        let out = lines(
+            "MultiEdit",
+            "f.rs",
+            json!({ "edits": [
+                { "old_string": "one", "new_string": "uno" },
+                { "old_string": "two", "new_string": "dos" },
+            ] }),
+        );
+        let removed: Vec<_> = out
+            .iter()
+            .filter(|l| l.kind == LineKind::ToolError)
+            .map(|l| l.text.clone())
+            .collect();
+        let added: Vec<_> = out
+            .iter()
+            .filter(|l| l.kind == LineKind::ToolCall && l.text.contains('+'))
+            .map(|l| l.text.clone())
+            .collect();
+        assert_eq!(removed, vec!["  - one", "  - two"]);
+        assert_eq!(added, vec!["  + uno", "  + dos"]);
     }
 }

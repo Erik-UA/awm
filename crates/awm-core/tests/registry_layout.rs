@@ -164,6 +164,7 @@ fn tail_ring_is_bounded() {
             &AgentEvent::ToolStarted {
                 name: format!("t{i}"),
                 summary: String::new(),
+                input: None,
             },
         );
     }
@@ -269,7 +270,14 @@ fn snapshot_restore_round_trips_projects_panes_and_active() {
     let a = reg.alloc_id();
     reg.add(AgentMeta::new(a, "builder", "/home/dev/awm".into(), 0));
     reg.apply_event(a, &AgentEvent::Started { model: "m".into(), cwd: "/home/dev/awm".into() });
-    reg.apply_event(a, &AgentEvent::ToolStarted { name: "Bash".into(), summary: "cargo build".into() });
+    reg.apply_event(
+        a,
+        &AgentEvent::ToolStarted {
+            name: "Bash".into(),
+            summary: "cargo build".into(),
+            input: None,
+        },
+    );
 
     // A second project with its own agent, and make it active.
     let p_web = reg.add_project("web", "/home/dev/web".into());

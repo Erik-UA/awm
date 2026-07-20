@@ -243,7 +243,20 @@ impl StreamParser {
                                     .unwrap_or("subagent")
                                     .to_string(),
                             });
-                        self.emit_routed(AgentEvent::ToolStarted { name, summary }, tid, spawn);
+                        // Keep the raw input for edit-family tools so the core
+                        // can render a diff; other tools don't need it (avoids
+                        // cloning large Bash/Read payloads).
+                        let input = matches!(
+                            name.as_str(),
+                            "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
+                        )
+                        .then(|| block.get("input").cloned())
+                        .flatten();
+                        self.emit_routed(
+                            AgentEvent::ToolStarted { name, summary, input },
+                            tid,
+                            spawn,
+                        );
                     }
                     // Other block kinds (e.g. tool_result echoes) carry no event.
                     _ => {}
@@ -512,11 +525,34 @@ mod tests {
         assert!(events.contains(&AgentEvent::ToolStarted {
             name: "Bash".into(),
             summary: "ls -la".into(),
+            input: None,
         }));
         assert!(events.contains(&AgentEvent::ToolResult {
             output: "total 4\nfile".into(),
             is_error: false,
         }));
+    }
+
+    #[test]
+    fn edit_tool_carries_input_for_diff_rendering() {
+        let mut p = StreamParser::new();
+        p.feed(br#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"f.rs","old_string":"a","new_string":"b"}}]}}
+"#);
+        let events: Vec<_> = std::iter::from_fn(|| p.next_event()).collect();
+        let input = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolStarted { name, input, .. } if name == "Edit" => Some(input),
+                _ => None,
+            })
+            .expect("Edit ToolStarted present")
+            .as_ref()
+            .expect("Edit carries its input for diffing");
+        assert_eq!(input["old_string"], "a");
+        assert_eq!(input["new_string"], "b");
+        // The one-line summary is still just the path.
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::ToolStarted { name, summary, .. } if name == "Edit" && summary == "f.rs")));
     }
 
     #[test]
@@ -711,6 +747,7 @@ mod tests {
             == AgentEvent::ToolStarted {
                 name: "Agent".into(),
                 summary: "run parser tests".into(),
+                input: None,
             }));
 
         // Nested sub-agent output (top-level parent_tool_use_id) is attributed.
