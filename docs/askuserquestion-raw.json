@@ -1,0 +1,30 @@
+{
+  "type": "control_request",
+  "request_id": "20378c99-06d2-436f-8eb7-723530c5347c",
+  "request": {
+    "subtype": "can_use_tool",
+    "tool_name": "AskUserQuestion",
+    "display_name": "AskUserQuestion",
+    "input": {
+      "questions": [
+        {
+          "question": "Do you prefer TABS or SPACES for indentation?",
+          "header": "Indentation",
+          "options": [
+            {
+              "label": "Tabs",
+              "description": "Use tab characters for indentation."
+            },
+            {
+              "label": "Spaces",
+              "description": "Use space characters for indentation."
+            }
+          ],
+          "multiSelect": false
+        }
+      ]
+    },
+    "tool_use_id": "toolu_01VJqLPYNrk32QM7pu1xo5DD",
+    "requires_user_interaction": true
+  }
+}

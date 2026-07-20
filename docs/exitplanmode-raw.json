@@ -1,0 +1,15 @@
+{
+  "type": "control_request",
+  "request_id": "23c6ba7a-2f4f-423b-9fcc-38333fc5072d",
+  "request": {
+    "subtype": "can_use_tool",
+    "tool_name": "ExitPlanMode",
+    "display_name": "ExitPlanMode",
+    "input": {
+      "plan": "# Plan: Add `--version` flag to the `awm` CLI\n\n## Context\nThe `awm` binary has no way to report its own version. Users and scripts\nexpect `awm --version` to print the build version. The crate version is\nalready defined (`0.1.0`, inherited from `[workspace.package]` in the root\n`Cargo.toml`), so it only needs to be surfaced at runtime \u2014 no dependency or\nmanifest change is required.\n\n## File to edit\n- `crates/awm/src/main.rs` \u2014 the only file changed.\n\n## The one function to change\n`main()` (`crates/awm/src/main.rs:390-446`). Args are parsed by hand via\n`std::env::args()`; there is no `clap`. Add a single early-return block right\nafter the args are collected (line 391), before the `--demo` check at line 393,\nmirroring the existing `args.iter().any(|a| a == \"...\")` mode-flag pattern:\n\n```rust\nif args.iter().any(|a| a == \"--version\" || a == \"-V\") {\n    println!(\"awm {}\", env!(\"CARGO_PKG_VERSION\"));\n    return Ok(());\n}\n```\n\nNotes:\n- `env!(\"CARGO_PKG_VERSION\")` resolves to the workspace version at build time;\n  the codebase already uses `env!(...)` (e.g. `CARGO_MANIFEST_DIR` at line 297).\n- `main` returns `std::io::Result<()>`, so `return Ok(())` is consistent.\n- Do not confuse this with `claude_version()` (lines 714-723), which shells out\n  to `claude --version` and is unrelated.\n\n## Verification\n- `cargo build && cargo test` (per CLAUDE.md, before committing).\n- `cargo run -p awm -- --version` prints `awm 0.1.0`.\n- `cargo run -p awm -- -V` prints the same.\n- Confirm existing flags still work (e.g. `cargo run -p awm -- --demo`) since the\n  new block returns early only on the version flag.\n",
+      "planFilePath": "/home/devops/.claude/plans/make-a-short-plan-parallel-chipmunk.md"
+    },
+    "tool_use_id": "toolu_019Vw3nSgRX2yqdXf1n1rcxU",
+    "requires_user_interaction": true
+  }
+}
