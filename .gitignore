@@ -3,3 +3,4 @@
 *.pending-snap
 .DS_Store
 /captures
+/.claude/
