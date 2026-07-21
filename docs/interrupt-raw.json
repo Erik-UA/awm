@@ -1,0 +1,58 @@
+{
+  "interrupt_request_sent": {
+    "type": "control_request",
+    "request_id": "awm-int",
+    "request": {
+      "subtype": "interrupt"
+    }
+  },
+  "interrupt_response": {
+    "type": "control_response",
+    "response": {
+      "subtype": "success",
+      "request_id": "awm-int",
+      "response": {
+        "still_queued": []
+      }
+    }
+  },
+  "result_after_interrupt": {
+    "type": "result",
+    "subtype": "error_during_execution",
+    "duration_ms": 1353,
+    "duration_api_ms": 0,
+    "is_error": true,
+    "num_turns": 2,
+    "stop_reason": null,
+    "session_id": "5d72b5a0-cf4c-41d6-819e-d5855281500f",
+    "total_cost_usd": 0,
+    "usage": {
+      "input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 0,
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard"
+    },
+    "modelUsage": {},
+    "permission_denials": [],
+    "terminal_reason": "aborted_streaming",
+    "fast_mode_state": "off",
+    "uuid": "e32270ff-f1e0-4f48-9ad2-703182cb6d5f",
+    "errors": [
+      "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"
+    ]
+  },
+  "session_alive_after": true,
+  "transcript_len": 18
+}

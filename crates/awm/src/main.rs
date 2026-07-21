@@ -1112,11 +1112,25 @@ fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
                         }
                         // `?` — toggle the keybinding help overlay; Esc closes it.
                         KeyCode::Char('?') if !ctrl => show_help = !show_help,
-                        KeyCode::Esc => show_help = false,
-                        // `i` — talk to the focused agent (send a follow-up).
+                        // `Esc` — close the help overlay if open; otherwise
+                        // interrupt the focused agent's current turn (the session
+                        // stays alive, like Esc in claude). A no-op if the agent
+                        // isn't actively working. (Gate/picker/shell/text-input
+                        // Esc are handled by their own earlier branches.)
+                        KeyCode::Esc => {
+                            if show_help {
+                                show_help = false;
+                            } else if let Some(f) = engine.registry().focus() {
+                                let _ = engine.interrupt(f);
+                                dirty = true;
+                            }
+                        }
+                        // `i` — talk to an agent. Prefer the pane holding the open
+                        // gate (so you can message a blocked agent), else the
+                        // focused pane.
                         KeyCode::Char('i') if !ctrl => {
-                            if let Some(f) = engine.registry().focus() {
-                                input = Some(Input::Message(f, String::new()));
+                            if let Some(t) = gate_target.or_else(|| engine.registry().focus()) {
+                                input = Some(Input::Message(t, String::new()));
                             }
                         }
                         // `r` — resume a restored (dead) pane into a live claude

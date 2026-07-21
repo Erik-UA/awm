@@ -536,7 +536,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
         &[
             ("Ctrl+p", "spawn an agent on this screen"),
             ("Ctrl+g", "open a shell console on this screen"),
-            ("i", "message the focused agent"),
+            ("i", "message an agent (works while it's blocked)"),
+            ("Esc", "interrupt the focused turn (session lives)"),
             ("r", "resume a restored (dead) claude pane"),
             ("Ctrl+x", "kill the focused agent / shell"),
         ],

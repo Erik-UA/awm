@@ -8,7 +8,7 @@
 
 use crate::registry::Registry;
 use awm_parser::{Spawn, StreamParser};
-use awm_proto::{AgentEvent, AgentId, AgentMeta, Tags};
+use awm_proto::{AgentEvent, AgentId, AgentMeta, AgentState, Tags};
 use awm_pty::{Answerer, CommandSpec, Decision, StreamJsonRunner};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -362,6 +362,40 @@ impl Engine {
         }
         self.reg
             .apply_event(id, &AgentEvent::ApprovalResolved { approved });
+        // If the user typed a message while this pane was blocked, deliver it now
+        // as a real user turn — the gate is resolved, so the session accepts input
+        // again (whether we allowed or denied). Sub-agent panes flush on the root.
+        if let Some(text) = self.reg.take_pending_message(id) {
+            if let Some(answerer) = self.answerers.get(&proc) {
+                let _ = answerer.send_prompt(&text);
+            }
+        }
+        Ok(())
+    }
+
+    /// Interrupt an agent's current turn **without ending the session** (the SDK
+    /// `interrupt` control_request — like pressing `Esc` in claude). Only a live,
+    /// actively-`Working` agent can be interrupted; idle/blocked/terminal agents
+    /// are a no-op (blocked agents are answered with `y`/`n`, not interrupted). A
+    /// sub-agent pane's interrupt is written to its root process's Answerer.
+    pub fn interrupt(&mut self, id: AgentId) -> std::io::Result<()> {
+        let working = self
+            .reg
+            .record(id)
+            .map(|r| matches!(r.state, AgentState::Working))
+            .unwrap_or(false);
+        if !working {
+            return Ok(());
+        }
+        let proc = if self.answerers.contains_key(&id) {
+            id
+        } else {
+            self.parent_of.get(&id).copied().unwrap_or(id)
+        };
+        if let Some(answerer) = self.answerers.get(&proc) {
+            answerer.interrupt()?;
+            self.reg.push_note(id, "\u{238b} interrupted".to_string());
+        }
         Ok(())
     }
 
@@ -373,6 +407,14 @@ impl Engine {
         if self.reg.record(id).map(|r| r.state.is_terminal()).unwrap_or(true) {
             self.reg
                 .push_note(id, "\u{25b7} (agent finished — can't message)".to_string());
+            return Ok(());
+        }
+        // A blocked agent is mid-`can_use_tool`, waiting for a `control_response`,
+        // not a `user` turn — queuing the text and flushing it when the gate
+        // resolves keeps the dialogue working without racing the control channel.
+        if self.reg.record(id).map(|r| r.state.is_blocked()).unwrap_or(false) {
+            self.reg.queue_message(id, text);
+            self.reg.push_note(id, format!("\u{25b7} you: {text}"));
             return Ok(());
         }
         if let Some(answerer) = self.answerers.get(&id) {

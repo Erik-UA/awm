@@ -46,6 +46,11 @@ pub struct AgentRecord {
     pub blocked_since: Option<u64>,
     /// The pending approval context while blocked (carries the `request_id`).
     pub pending: Option<ApprovalCtx>,
+    /// A user message typed while the agent was blocked on approval. The process
+    /// is mid-`can_use_tool` (waiting for a `control_response`, not a `user`
+    /// turn), so we stash the text here and flush it as a real user turn the
+    /// moment the gate resolves. See [`Registry::take_pending_message`].
+    pub pending_message: Option<String>,
     /// Session metadata from `init` (model, mode, tools/skills/plugins…).
     pub info: Option<AgentInfo>,
     /// Whether this agent is a live-resumable Claude session (spawned with the
@@ -149,6 +154,7 @@ impl Registry {
             tail: VecDeque::new(),
             blocked_since: None,
             pending: None,
+            pending_message: None,
             info: None,
             resumable: false,
             kind: PaneKind::Agent,
@@ -488,6 +494,29 @@ impl Registry {
         }
     }
 
+    /// Queue a user message typed while the agent is blocked on approval, to be
+    /// delivered once the gate resolves. Multiple queued messages accumulate
+    /// (newline-joined) so nothing is lost.
+    pub fn queue_message(&mut self, id: AgentId, text: &str) {
+        if let Some(rec) = self.agents.get_mut(&id) {
+            match &mut rec.pending_message {
+                Some(existing) => {
+                    existing.push('\n');
+                    existing.push_str(text);
+                }
+                none => *none = Some(text.to_string()),
+            }
+        }
+    }
+
+    /// Take (and clear) any message queued while the agent was blocked. Called
+    /// when the gate resolves so the text can be flushed as a real user turn.
+    pub fn take_pending_message(&mut self, id: AgentId) -> Option<String> {
+        self.agents
+            .get_mut(&id)
+            .and_then(|rec| rec.pending_message.take())
+    }
+
     /// Optimistically record a permission-mode switch for the status bar.
     pub fn set_permission_mode(&mut self, id: AgentId, mode: &str) {
         if let Some(rec) = self.agents.get_mut(&id) {
@@ -513,6 +542,7 @@ impl Registry {
                 rec.state = AgentState::Idle;
             }
             rec.pending = None;
+            rec.pending_message = None;
             rec.blocked_since = None;
             rec.meta.urgent = false;
             rec.streaming = false;

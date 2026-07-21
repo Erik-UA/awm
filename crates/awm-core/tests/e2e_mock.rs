@@ -307,6 +307,118 @@ fn denying_makes_the_agent_fail() {
     engine.join();
 }
 
+/// Esc → interrupt: a running turn is stopped without killing the session. The
+/// interrupt control_request reaches the process (it acks with "turn-interrupted")
+/// and the pane shows the `⎋ interrupted` note; the persistent session stays alive.
+#[test]
+fn interrupt_stops_the_turn_and_keeps_the_session_alive() {
+    let mut engine = Engine::new();
+    let id = engine
+        .spawn(script_spec("mock-interrupt.py"), "int", Tags::empty(), None, false, true)
+        .unwrap();
+
+    let tail_has = |e: &Engine, needle: &str| {
+        e.registry()
+            .record(id)
+            .map(|r| r.tail.iter().any(|l| l.text.contains(needle)))
+            .unwrap_or(false)
+    };
+
+    // A running turn (a tool call streamed in, no gate).
+    assert!(pump_until(&mut engine, |e| e
+        .registry()
+        .record(id)
+        .map(|r| matches!(r.state, AgentState::Working))
+        .unwrap_or(false)));
+    assert!(
+        engine.registry().pending_request_id(id).is_none(),
+        "this is a running turn, not an approval gate"
+    );
+
+    engine.interrupt(id).unwrap();
+
+    // The interrupt reached the process (it acked) and the note is shown.
+    assert!(pump_until(&mut engine, |e| tail_has(e, "turn-interrupted")));
+    assert!(tail_has(&engine, "\u{238b}"), "the ⎋ interrupted note is shown");
+    // Session survives — persistent process, not terminal.
+    assert!(!engine.registry().record(id).unwrap().state.is_terminal());
+
+    engine.shutdown();
+    engine.join();
+}
+
+/// Interrupt is a no-op unless the agent is actively working — a BlockedOnApproval
+/// agent is answered (y/n), never interrupted; its gate must stay untouched.
+#[test]
+fn interrupt_is_a_noop_for_a_blocked_agent() {
+    let mut engine = Engine::new();
+    let id = engine.spawn(mock_spec(), "b", Tags::empty(), None, false, false).unwrap();
+
+    assert!(pump_until(&mut engine, |e| e
+        .registry()
+        .pending_request_id(id)
+        .is_some()));
+    let before = engine.registry().record(id).unwrap().tail.len();
+
+    engine.interrupt(id).unwrap(); // blocked, not Working → no-op
+
+    assert_eq!(
+        engine.registry().record(id).unwrap().tail.len(),
+        before,
+        "interrupt must add no note to a blocked agent"
+    );
+    assert!(
+        engine.registry().pending_request_id(id).is_some(),
+        "the gate must remain pending"
+    );
+
+    engine.answer(id, Decision::Allow).unwrap(); // let it finish cleanly
+    engine.join();
+}
+
+/// A message typed while an agent is blocked on approval is QUEUED (the process is
+/// mid-can_use_tool, waiting for a control_response) and flushed as a real user
+/// turn the moment the gate resolves — the agent then echoes it.
+#[test]
+fn message_typed_while_blocked_is_delivered_after_gate_resolves() {
+    let mut engine = Engine::new();
+    let id = engine
+        .spawn(script_spec("mock-gate-chat.py"), "gc", Tags::empty(), None, false, true)
+        .unwrap();
+
+    assert!(pump_until(&mut engine, |e| e
+        .registry()
+        .pending_request_id(id)
+        .is_some()));
+
+    // Message the blocked agent: queued, not sent yet.
+    engine.send_message(id, "while blocked").unwrap();
+    {
+        let rec = engine.registry().record(id).unwrap();
+        assert_eq!(rec.state, AgentState::BlockedOnApproval);
+        assert!(
+            rec.tail.iter().any(|l| l.text.contains("you: while blocked")),
+            "the user's line is echoed immediately"
+        );
+        assert!(rec.pending_message.is_some(), "message is held until the gate resolves");
+    }
+
+    // Approve → gate resolves → queued message flushes → mock echoes it back.
+    engine.answer(id, Decision::Allow).unwrap();
+    assert!(pump_until(&mut engine, |e| e
+        .registry()
+        .record(id)
+        .map(|r| r.tail.iter().any(|l| l.text.contains("echo: while blocked")))
+        .unwrap_or(false)));
+    assert!(
+        engine.registry().record(id).unwrap().pending_message.is_none(),
+        "the queue is cleared once delivered"
+    );
+
+    engine.shutdown();
+    engine.join();
+}
+
 /// Real-shape sub-agent approval routing: a parent that spawns two background
 /// sub-agents (via the `Agent` tool) whose inner Bash calls each raise a
 /// `can_use_tool` gate. Each gate must land in its OWN sub-agent pane (correlated

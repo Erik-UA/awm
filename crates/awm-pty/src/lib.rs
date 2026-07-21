@@ -583,6 +583,15 @@ impl Answerer {
         )
     }
 
+    /// Interrupt the agent's current turn without ending the session — the
+    /// runtime equivalent of pressing `Esc` in claude. The persistent process
+    /// stays alive and accepts further `user` turns afterward.
+    pub fn interrupt(&self) -> std::io::Result<()> {
+        self.write_line(
+            r#"{"type":"control_request","request_id":"awm-int","request":{"subtype":"interrupt"}}"#,
+        )
+    }
+
     /// Switch the agent's permission mode (`default` / `plan` / `acceptEdits` /
     /// `bypassPermissions`) — the runtime equivalent of Shift+Tab in claude.
     pub fn set_permission_mode(&self, mode: &str) -> std::io::Result<()> {

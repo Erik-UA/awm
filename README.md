@@ -38,7 +38,9 @@ Press `y` to approve the master agent, `n` to deny — the response goes back ov
 the agent's control channel and it resumes. No entering the session. Press `i` to
 send a follow-up message to the focused agent and watch its reply in the window —
 agents run as **persistent** sessions, so you can hold a real multi-turn
-conversation (`awm --claude "…"` then keep talking with `i`).
+conversation (`awm --claude "…"` then keep talking with `i`). Press `Esc` to
+**interrupt** a runaway turn without ending the session — it stops, stays alive,
+and you can steer it with `i`.
 
 ## Quick start
 
@@ -62,7 +64,8 @@ cargo run -p awm            # spawns three mock agents
 | Key | Action |
 |-----|--------|
 | `y` / `n` | approve / deny the agent in the master zone |
-| `i` | message the focused agent — type, `Enter` sends, `Esc` cancels |
+| `i` | message an agent — type, `Enter` sends, `Esc` cancels. Works even while the agent is blocked on approval: the message is queued and delivered the moment you answer the gate |
+| `Esc` | interrupt the focused agent's current turn — stops the work but keeps the session alive (like `Esc` in Claude Code), so you can `i` it again. No-op unless it's actively working |
 | `e` | expand the pending request (monocle) |
 | `Ctrl+j` / `Ctrl+k` | move focus down / up |
 | `Ctrl+Enter` | back to tiling (focus in master) |
@@ -118,7 +121,7 @@ reverse-engineered and verified against Claude Code 2.1.212; see
 
 - Pinned to **rustc 1.75 / edition 2021**; `Cargo.lock` holds MSRV-compatible
   dependency versions (do not add edition-2024 crates).
-- `cargo build --workspace` · `cargo test --workspace` (42 tests, incl. a
+- `cargo build --workspace` · `cargo test --workspace` (45 tests, incl. a
   headless end-to-end run driven by mock agents — never a live `claude`).
 - `fmt`/`clippy` run in CI.
 - `scripts/tty-smoke.py` drives the interactive TUI in a real pseudo-terminal
