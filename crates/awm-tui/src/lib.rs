@@ -559,7 +559,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
             ("Ctrl+m", "toggle monocle (full-screen)"),
             ("Ctrl+t", "toggle approval triage"),
             ("Tab", "toggle the agent inspect card"),
-            ("Shift+Tab", "cycle permission mode"),
+            ("Shift+Tab", "mode: default → auto-accept → plan → bypass"),
             ("PgUp/PgDn", "scroll (Home/End = top/bottom)"),
         ],
     );
@@ -1495,6 +1495,20 @@ fn find_double(chars: &[char], from: usize, c: char) -> Option<usize> {
     (from..chars.len().saturating_sub(1)).find(|&j| chars[j] == c && chars[j + 1] == c)
 }
 
+/// A short, glyph-carrying label for a permission mode, shown in the status bar.
+/// The auto-approving modes get a leading `⏵`/`⏵⏵` so "auto is on" reads at a
+/// glance (mirrors Claude Code's own `⏵⏵ bypass permissions` footer). `default`
+/// (and empty) render as nothing; unknown modes fall through verbatim for
+/// forward-compat.
+fn mode_badge(mode: &str) -> String {
+    match mode {
+        "" | "default" => String::new(),
+        "acceptEdits" => "\u{23f5} auto-accept".to_string(),
+        "bypassPermissions" => "\u{23f5}\u{23f5} bypass".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// The per-agent status bar: `[! ]<id> <name> [tags] <state> <total>tok[ · <mode>]`.
 ///
 /// The leading `! ` marker is emitted for urgent agents so the highlight is
@@ -1505,7 +1519,7 @@ fn status_bar(view: &AgentView) -> String {
     let mode = view
         .info
         .as_ref()
-        .map(|i| i.permission_mode.as_str())
+        .map(|i| mode_badge(&i.permission_mode))
         .filter(|m| !m.is_empty())
         .map(|m| format!(" \u{b7} {m}"))
         .unwrap_or_default();
@@ -1782,6 +1796,35 @@ mod tests {
             ..Default::default()
         }));
         assert_eq!(status_bar(&view), "@0 builder [-] 120tok \u{b7} plan");
+    }
+
+    #[test]
+    fn status_bar_badges_auto_modes() {
+        let accept = view_with_info(Some(AgentInfo {
+            permission_mode: "acceptEdits".into(),
+            ..Default::default()
+        }));
+        assert_eq!(
+            status_bar(&accept),
+            "@0 builder [-] 120tok \u{b7} \u{23f5} auto-accept"
+        );
+        let bypass = view_with_info(Some(AgentInfo {
+            permission_mode: "bypassPermissions".into(),
+            ..Default::default()
+        }));
+        assert_eq!(
+            status_bar(&bypass),
+            "@0 builder [-] 120tok \u{b7} \u{23f5}\u{23f5} bypass"
+        );
+    }
+
+    #[test]
+    fn status_bar_omits_badge_for_default_mode() {
+        let view = view_with_info(Some(AgentInfo {
+            permission_mode: "default".into(),
+            ..Default::default()
+        }));
+        assert_eq!(status_bar(&view), "@0 builder [-] 120tok");
     }
 
     #[test]

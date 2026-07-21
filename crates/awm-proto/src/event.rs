@@ -90,6 +90,12 @@ pub struct ApprovalCtx {
     /// A unified diff for edit-style tools, when awm derives one for display.
     /// Not present on the wire — populated by the core, not the control channel.
     pub diff: Option<String>,
+    /// The CLI's `permission_suggestions` for this gate, kept opaque (each is a
+    /// raw object like `{"type":"setMode","mode":"acceptEdits",...}`). The UI
+    /// surfaces the `setMode` ones as "allow & switch to <mode> (don't ask
+    /// again)" choices. `#[serde(default)]` keeps older wire/snapshots loadable.
+    #[serde(default)]
+    pub suggestions: Vec<serde_json::Value>,
 }
 
 /// Session metadata reported at `init`. All lists come straight from the CLI.
