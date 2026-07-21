@@ -12,6 +12,7 @@ fn ctx(request_id: &str, tool: &str) -> ApprovalCtx {
         description: Some("do a thing".into()),
         decision_reason: None,
         diff: None,
+        suggestions: Vec::new(),
     }
 }
 

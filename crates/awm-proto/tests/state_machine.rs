@@ -13,6 +13,7 @@ fn approval() -> AgentEvent {
         description: Some("ls".into()),
         decision_reason: None,
         diff: None,
+        suggestions: Vec::new(),
     })
 }
 

@@ -39,8 +39,8 @@ pub enum Action {
     ScrollBottom,
     /// `Ctrl+i` — toggle the agent inspection card (skills / plugins / tools).
     Inspect,
-    /// `Shift+Tab` — cycle the focused agent's permission mode (default → plan →
-    /// acceptEdits), like claude's own mode cycling.
+    /// `Shift+Tab` — cycle the focused agent's permission mode (default →
+    /// acceptEdits → plan → bypassPermissions), like claude's own mode cycling.
     CycleMode,
 }
 

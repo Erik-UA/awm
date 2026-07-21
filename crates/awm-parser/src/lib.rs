@@ -364,6 +364,11 @@ impl StreamParser {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             diff: None,
+            suggestions: request
+                .get("permission_suggestions")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
         };
         self.emit(AgentEvent::ApprovalRequested(ctx));
     }
@@ -594,6 +599,40 @@ mod tests {
             agents: vec![],
             session_id: None,
         })));
+    }
+
+    #[test]
+    fn can_use_tool_carries_permission_suggestions() {
+        let mut p = StreamParser::new();
+        p.feed(br#"{"type":"control_request","request_id":"req-1","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"/tmp/x"},"permission_suggestions":[{"type":"setMode","mode":"acceptEdits","destination":"session"},{"type":"addDirectories","directories":["/tmp"]}]}}
+"#);
+        let events: Vec<_> = std::iter::from_fn(|| p.next_event()).collect();
+        let ctx = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ApprovalRequested(c) => Some(c),
+                _ => None,
+            })
+            .expect("ApprovalRequested");
+        assert_eq!(ctx.suggestions.len(), 2);
+        assert_eq!(ctx.suggestions[0]["type"], "setMode");
+        assert_eq!(ctx.suggestions[0]["mode"], "acceptEdits");
+    }
+
+    #[test]
+    fn can_use_tool_without_suggestions_is_empty() {
+        let mut p = StreamParser::new();
+        p.feed(br#"{"type":"control_request","request_id":"req-2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}
+"#);
+        let events: Vec<_> = std::iter::from_fn(|| p.next_event()).collect();
+        let ctx = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ApprovalRequested(c) => Some(c),
+                _ => None,
+            })
+            .expect("ApprovalRequested");
+        assert!(ctx.suggestions.is_empty());
     }
 
     #[test]

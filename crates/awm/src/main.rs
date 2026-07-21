@@ -236,10 +236,17 @@ const SCROLL_STEP: u16 = 8;
 const MOUSE_SCROLL_STEP: u16 = 3;
 
 /// The next permission mode in the Shift+Tab cycle (bypassPermissions excluded).
+/// Cycle the focused agent's permission mode on Shift+Tab, mirroring Claude
+/// Code's own order: `default → acceptEdits → plan → bypassPermissions →
+/// default`. `acceptEdits` comes first to match the interactive muscle memory
+/// (one Shift+Tab = auto-accept edits); `bypassPermissions` (full auto) is
+/// reachable only because `claude_spec` launches with
+/// `--allow-dangerously-skip-permissions`.
 fn next_mode(current: &str) -> &'static str {
     match current {
-        "default" => "plan",
-        "plan" => "acceptEdits",
+        "default" => "acceptEdits",
+        "acceptEdits" => "plan",
+        "plan" => "bypassPermissions",
         _ => "default",
     }
 }
@@ -291,6 +298,11 @@ fn claude_spec(cwd: PathBuf, resume: Option<&str>) -> CommandSpec {
         .arg("--verbose")
         .arg("--permission-prompt-tool")
         .arg("stdio")
+        // Permit a runtime switch INTO `bypassPermissions` (Shift+Tab) without
+        // starting there: unlike `--dangerously-skip-permissions` (which begins
+        // in bypass and would kill the urgent→master gate feature), this flag
+        // only *allows* the mode. The session still starts in `default`.
+        .arg("--allow-dangerously-skip-permissions")
         .arg("--include-partial-messages");
     if let Some(id) = resume {
         spec = spec.arg("--resume").arg(id);
@@ -1123,6 +1135,12 @@ fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
                                     engine.registry().record(t).and_then(|r| r.pending.clone())
                                 {
                                     let _ = engine.answer(t, decision_for_gate(&ctx, &chosen));
+                                    // A "don't ask again" choice also flips the
+                                    // agent's permission mode so future calls of
+                                    // this class auto-approve.
+                                    if let Some(mode) = mode_switch_for_gate(&ctx, &chosen) {
+                                        let _ = engine.set_permission_mode(t, &mode);
+                                    }
                                     scroll = 0;
                                 }
                             }
@@ -1543,15 +1561,65 @@ fn gate_from_ctx(ctx: &awm_proto::ApprovalCtx) -> Option<awm_tui::GateView> {
             if let Some(r) = &ctx.decision_reason {
                 body.push(TranscriptLine::new(LineKind::Note, r.clone()));
             }
+            // Base Yes(0)/No(1), plus one "allow & don't ask again" option per
+            // `setMode` permission suggestion the CLI attached (e.g. switch to
+            // acceptEdits). Selecting one both allows this call and flips the
+            // agent's permission mode — see `mode_switch_for_gate`.
+            let mut options = vec![GateOption::new("Yes"), GateOption::new("No")];
+            for m in set_mode_suggestions(ctx) {
+                options.push(GateOption::new(format!(
+                    "Yes, & {} (don't ask again)",
+                    mode_action_label(&m)
+                )));
+            }
             Some(GateView {
                 title: other.to_string(),
                 body,
-                groups: vec![single("", "", &["Yes", "No"], false)],
+                groups: vec![GateGroup {
+                    header: String::new(),
+                    prompt: String::new(),
+                    options,
+                    selected: 0,
+                    multi: false,
+                }],
                 cursor_group: 0,
                 cursor_opt: 0,
             })
         }
     }
+}
+
+/// The distinct `setMode` permission-mode suggestions the CLI attached to a
+/// gate, in order (e.g. `["acceptEdits"]`). Other suggestion kinds
+/// (`addDirectories`, …) are ignored for now.
+fn set_mode_suggestions(ctx: &awm_proto::ApprovalCtx) -> Vec<String> {
+    ctx.suggestions
+        .iter()
+        .filter(|s| s.get("type").and_then(|v| v.as_str()) == Some("setMode"))
+        .filter_map(|s| s.get("mode").and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Human label for the action of switching into `mode`, used in a gate option.
+fn mode_action_label(mode: &str) -> String {
+    match mode {
+        "acceptEdits" => "auto-accept edits".to_string(),
+        "bypassPermissions" => "bypass all permissions".to_string(),
+        "plan" => "switch to plan mode".to_string(),
+        other => format!("switch to {other}"),
+    }
+}
+
+/// If the chosen gate option is one of the appended `setMode` suggestions,
+/// return the mode to switch the agent into (in addition to allowing the call).
+/// Suggestion options live after the base Yes(0)/No(1) pair in the first group.
+fn mode_switch_for_gate(ctx: &awm_proto::ApprovalCtx, chosen: &[Vec<usize>]) -> Option<String> {
+    let idx = *chosen.first().and_then(|g| g.first())?;
+    if idx < 2 {
+        return None;
+    }
+    set_mode_suggestions(ctx).into_iter().nth(idx - 2)
 }
 
 /// Translate the menu's per-group `chosen()` indices into a control-channel
@@ -1561,12 +1629,14 @@ fn gate_from_ctx(ctx: &awm_proto::ApprovalCtx) -> Option<awm_tui::GateView> {
 fn decision_for_gate(ctx: &awm_proto::ApprovalCtx, chosen: &[Vec<usize>]) -> Decision {
     match ctx.tool.as_str() {
         "AskUserQuestion" => askq_decision(ctx, chosen),
-        // First group, option 0 = "yes/proceed" ⇒ allow; anything else ⇒ deny.
+        // First group: option 1 ("No") ⇒ deny; option 0 ("Yes") and any
+        // appended "Yes, & <mode> (don't ask again)" suggestion ⇒ allow (the
+        // mode switch itself is applied by the caller via `mode_switch_for_gate`).
         _ => {
-            if chosen.first().and_then(|g| g.first()) == Some(&0) {
-                Decision::Allow
-            } else {
+            if chosen.first().and_then(|g| g.first()) == Some(&1) {
                 Decision::Deny("declined from awm".into())
+            } else {
+                Decision::Allow
             }
         }
     }
@@ -1878,7 +1948,7 @@ mod picker_tests {
 /// (see `docs/gate-answer-findings.md`); never invokes a live claude.
 #[cfg(test)]
 mod gate_tests {
-    use super::{decision_for_gate, gate_from_ctx, Decision};
+    use super::{decision_for_gate, gate_from_ctx, mode_switch_for_gate, Decision};
 
     /// Build an `ApprovalCtx` from a captured `can_use_tool` fixture envelope.
     fn ctx_from_fixture(name: &str) -> awm_proto::ApprovalCtx {
@@ -1894,6 +1964,10 @@ mod gate_tests {
             description: req["description"].as_str().map(String::from),
             decision_reason: req["decision_reason"].as_str().map(String::from),
             diff: None,
+            suggestions: req["permission_suggestions"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
         }
     }
 
@@ -1960,11 +2034,45 @@ mod gate_tests {
             description: Some("rm -rf build".into()),
             decision_reason: None,
             diff: None,
+            suggestions: Vec::new(),
         };
         let g = gate_from_ctx(&ctx).expect("generic gate");
         assert_eq!(g.title, "Bash");
         assert_eq!(g.groups[0].options.len(), 2); // Yes / No
         assert!(matches!(decision_for_gate(&ctx, &[vec![0]]), Decision::Allow));
         assert!(matches!(decision_for_gate(&ctx, &[vec![1]]), Decision::Deny(_)));
+    }
+
+    #[test]
+    fn set_mode_suggestion_adds_dont_ask_again_option() {
+        let ctx = awm_proto::ApprovalCtx {
+            tool: "Write".into(),
+            input: serde_json::json!({"file_path": "/tmp/x", "content": "hi"}),
+            request_id: "r1".into(),
+            tool_use_id: None,
+            description: Some("/tmp/x".into()),
+            decision_reason: Some("Path is outside allowed working directories".into()),
+            diff: None,
+            suggestions: vec![
+                serde_json::json!({"type":"setMode","mode":"acceptEdits","destination":"session"}),
+                // A non-setMode suggestion must be ignored (no extra option).
+                serde_json::json!({"type":"addDirectories","directories":["/tmp"]}),
+            ],
+        };
+        let g = gate_from_ctx(&ctx).expect("gate");
+        // Yes, No, and exactly one appended "don't ask again" option.
+        assert_eq!(g.groups[0].options.len(), 3);
+        assert!(g.groups[0].options[2].label.contains("auto-accept edits"));
+        // Option 0 and the suggestion option both allow; option 1 denies.
+        assert!(matches!(decision_for_gate(&ctx, &[vec![0]]), Decision::Allow));
+        assert!(matches!(decision_for_gate(&ctx, &[vec![2]]), Decision::Allow));
+        assert!(matches!(decision_for_gate(&ctx, &[vec![1]]), Decision::Deny(_)));
+        // Only the suggestion option triggers a mode switch, to the right mode.
+        assert_eq!(mode_switch_for_gate(&ctx, &[vec![0]]), None);
+        assert_eq!(mode_switch_for_gate(&ctx, &[vec![1]]), None);
+        assert_eq!(
+            mode_switch_for_gate(&ctx, &[vec![2]]).as_deref(),
+            Some("acceptEdits")
+        );
     }
 }

@@ -548,6 +548,7 @@ mod tests {
                 description: None,
                 decision_reason: None,
                 diff: None,
+                suggestions: Vec::new(),
             }),
             parent_tool_use_id: None,
             tool_use_id: None,
