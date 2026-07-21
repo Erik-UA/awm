@@ -20,7 +20,8 @@ use awm_tui::keymap::{map_key, Action};
 use awm_tui::AwmTui;
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyModifiers, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -965,6 +966,30 @@ fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
                     }
                     _ => {}
                 }
+            } else if let Event::Paste(text) = ev {
+                // A bracketed paste arrives as ONE event — never a stream of key
+                // events — so an embedded newline can't submit early and the rest
+                // can't be misread as hotkeys. Route it by the same modal priority
+                // the key handler uses; anywhere else, drop it.
+                if let Some(p) = picker.as_mut() {
+                    for c in text.chars() {
+                        if !c.is_control() {
+                            p.push_query(c);
+                        }
+                    }
+                } else if let Some(i) = input.as_mut() {
+                    // Verbatim (newlines kept) so the whole plan reaches the agent
+                    // on Enter; the bar shows the tail. Enter is a separate event.
+                    i.buffer().push_str(&text);
+                } else if let Some(fid) = engine
+                    .registry()
+                    .focus()
+                    .filter(|f| shells.contains_key(f) && !prefix_pending)
+                {
+                    if let Some(sh) = shells.get_mut(&fid) {
+                        let _ = sh.write(text.as_bytes());
+                    }
+                }
             } else if let Event::Key(key) = ev {
                 if let Some(p) = picker.as_mut() {
                     // Directory-browser mode (Ctrl+n). Typing filters the list by
@@ -1747,7 +1772,12 @@ struct TermGuard;
 impl TermGuard {
     fn enter() -> std::io::Result<Self> {
         enable_raw_mode()?;
-        crossterm::execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        crossterm::execute!(
+            stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )?;
         Ok(TermGuard)
     }
 }
@@ -1755,7 +1785,12 @@ impl TermGuard {
 impl Drop for TermGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = crossterm::execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = crossterm::execute!(
+            stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
     }
 }
 

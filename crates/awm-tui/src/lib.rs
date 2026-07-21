@@ -757,9 +757,33 @@ fn wrap_joined(items: &[String], sep: &str, width: usize) -> Vec<String> {
 /// The bottom input bar (the caller supplies the full label + text; a block
 /// cursor is appended). Used for both the spawn prompt and agent messages.
 fn draw_prompt_bar(frame: &mut Frame, text: &str, area: Rect) {
-    let line = format!("{text}\u{2588}");
+    let line = format!("{}\u{2588}", clip_prompt(text, area.width));
     let style = Style::default().fg(Color::Black).bg(Color::Cyan);
     frame.render_widget(Paragraph::new(line).style(style), area);
+}
+
+/// Single-line preview of the input buffer for the 1-row prompt bar: control
+/// chars (newlines/tabs from a paste) are flattened to spaces, and the string is
+/// clipped to its LAST `width - 1` chars — leaving one column for the cursor block
+/// the caller appends — prefixed with `…` when truncated. Char-based throughout,
+/// so it never panics or splits a multibyte char.
+fn clip_prompt(text: &str, width: u16) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    // Reserve one column for the trailing cursor block drawn by the caller.
+    let budget = width.saturating_sub(1) as usize;
+    if budget == 0 {
+        return String::new();
+    }
+    let count = flat.chars().count();
+    if count <= budget {
+        return flat;
+    }
+    // Keep the tail; one visible column goes to the `…` truncation marker.
+    let tail: String = flat.chars().skip(count - (budget - 1)).collect();
+    format!("\u{2026}{tail}")
 }
 
 /// Find an agent view by id.
@@ -1613,6 +1637,36 @@ mod tests {
 
     fn names(prefix: &str, n: usize) -> Vec<String> {
         (0..n).map(|i| format!("{prefix}{i}")).collect()
+    }
+
+    #[test]
+    fn clip_prompt_shows_tail_and_flattens_newlines() {
+        // Short text fits untouched.
+        assert_eq!(clip_prompt("spawn> hi", 40), "spawn> hi");
+
+        // Embedded newline/tab (from a paste) become spaces — stays one line.
+        assert_eq!(clip_prompt("a\nb\tc", 40), "a b c");
+        assert!(!clip_prompt("plan:\nstep 1\nstep 2", 40).contains('\n'));
+
+        // A string wider than the bar keeps the TAIL (with a `…` marker) and never
+        // exceeds `width - 1` visible chars (one column reserved for the cursor).
+        let long = "0123456789abcdef"; // 16 chars
+        let clipped = clip_prompt(long, 10); // budget = 9 visible
+        assert_eq!(clipped.chars().count(), 9);
+        assert!(clipped.starts_with('\u{2026}'));
+        assert!(clipped.ends_with('f'), "the newest (tail) end stays visible");
+
+        // Multibyte (Cyrillic) counts by char and never panics / splits a char.
+        let cyr = "привет мир это длинная строка плана"; // > width
+        let c = clip_prompt(cyr, 12);
+        assert_eq!(c.chars().count(), 11);
+        assert!(c.ends_with('а'));
+
+        // Degenerate widths don't panic (no room once the cursor column is
+        // reserved → empty; width 2 leaves exactly one column for the `…`).
+        assert_eq!(clip_prompt("x", 0), "");
+        assert_eq!(clip_prompt("xyz", 1), "");
+        assert_eq!(clip_prompt("xyz", 2), "\u{2026}");
     }
 
     fn card_view() -> AgentView {
