@@ -4,6 +4,7 @@
 //! each agent's state/tokens/recent-output, and tracks approval waits so the
 //! layout engine can promote the oldest-blocked agent to the master zone.
 
+use crate::session::PaneKind;
 use awm_proto::{
     AgentEvent, AgentId, AgentInfo, AgentMeta, AgentState, AgentView, ApprovalCtx, LineKind, Tags,
     TokenUsage, TranscriptLine,
@@ -52,6 +53,10 @@ pub struct AgentRecord {
     /// back live via `claude --resume` on restore — a mock's `session_id` (e.g.
     /// `"mock-1"`) is not a real Claude session.
     pub resumable: bool,
+    /// Whether this pane is a Claude agent or an interactive shell console.
+    /// Shells bypass the stream-json runtime (their PTY lives in the binary) and
+    /// are re-spawned fresh on restore rather than resumed.
+    pub kind: PaneKind,
     /// Whether the last tail line is an in-progress streamed reply.
     streaming: bool,
 }
@@ -146,6 +151,7 @@ impl Registry {
             pending: None,
             info: None,
             resumable: false,
+            kind: PaneKind::Agent,
             streaming: false,
         }
     }
@@ -162,6 +168,18 @@ impl Registry {
     pub fn add(&mut self, meta: AgentMeta) {
         let proj = self.active;
         self.add_in(proj, None, meta);
+    }
+
+    /// Register a new interactive **shell** pane in the active project. Identical
+    /// to [`Registry::add`] except the record is marked [`PaneKind::Shell`] so it
+    /// persists/restores as a shell (re-spawned fresh) rather than an agent. Its
+    /// live PTY is owned by the binary, not the [`crate::Engine`].
+    pub fn add_shell(&mut self, meta: AgentMeta) {
+        let id = meta.id;
+        self.add(meta);
+        if let Some(rec) = self.agents.get_mut(&id) {
+            rec.kind = PaneKind::Shell;
+        }
     }
 
     /// Register a new (Idle) agent immediately after `anchor` in roster order, so
@@ -564,6 +582,7 @@ impl Registry {
                     session_id: rec.info.as_ref().and_then(|i| i.session_id.clone()),
                     is_subagent: rec.meta.name.starts_with('\u{21b3}'),
                     resumable: rec.resumable,
+                    kind: rec.kind,
                 })
             })
             .collect();
@@ -604,6 +623,7 @@ impl Registry {
             rec.info = snap.info.clone();
             rec.tail = snap.tail.iter().cloned().collect();
             rec.resumable = snap.resumable;
+            rec.kind = snap.kind;
             self.agents.insert(id, rec);
             self.order.push(id);
             self.project_of.insert(id, snap.project_id);

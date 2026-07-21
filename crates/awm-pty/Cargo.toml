@@ -13,3 +13,4 @@ portable-pty = { workspace = true }
 # controller over the stream-json control channel. `process` is added on top of
 # the workspace feature set so we can drive the child asynchronously.
 tokio = { workspace = true, features = ["process"] }
+vt100 = "0.16.2"

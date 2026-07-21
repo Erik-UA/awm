@@ -314,6 +314,53 @@ fn snapshot_restore_round_trips_projects_panes_and_active() {
 }
 
 #[test]
+fn shell_panes_snapshot_and_restore_with_shell_kind() {
+    use awm_core::session::PaneKind;
+    use awm_core::SessionState;
+
+    let mut reg = Registry::new();
+    let agent = reg.alloc_id();
+    reg.add(AgentMeta::new(agent, "builder", "/home/dev/awm".into(), 0));
+    let shell = reg.alloc_id();
+    reg.add_shell(AgentMeta::new(shell, "shell", "/home/dev/awm".into(), 0));
+
+    let json = serde_json::to_string(&reg.snapshot()).unwrap();
+    let state: SessionState = serde_json::from_str(&json).unwrap();
+    // The shell snapshot carries kind = Shell; the agent stays Agent.
+    let kinds: Vec<(_, _)> = state.agents.iter().map(|a| (a.meta.id, a.kind)).collect();
+    assert!(kinds.contains(&(agent, PaneKind::Agent)));
+    assert!(kinds.contains(&(shell, PaneKind::Shell)));
+
+    let mut restored = Registry::new();
+    restored.restore(&state);
+    assert_eq!(restored.record(agent).unwrap().kind, PaneKind::Agent);
+    assert_eq!(restored.record(shell).unwrap().kind, PaneKind::Shell);
+}
+
+#[test]
+fn old_session_without_kind_field_defaults_to_agent() {
+    use awm_core::session::PaneKind;
+    use awm_core::SessionState;
+
+    // A v1 snapshot written before `kind` existed (field absent).
+    let json = r#"{
+        "version": 1,
+        "projects": [{"id": 0, "name": "main", "cwd": "/tmp"}],
+        "active": 0,
+        "agents": [{
+            "project_id": 0,
+            "meta": {"id": 0, "name": "builder", "tags": "", "cwd": "/tmp", "started_at": 0, "urgent": false},
+            "state": "idle",
+            "info": null,
+            "tokens": {"input": 0, "output": 0},
+            "tail": []
+        }]
+    }"#;
+    let state: SessionState = serde_json::from_str(json).unwrap();
+    assert_eq!(state.agents[0].kind, PaneKind::Agent, "missing kind defaults to Agent");
+}
+
+#[test]
 fn remove_project_drops_its_panes_and_switches_active() {
     let mut reg = Registry::new();
     let p_default = reg.active();

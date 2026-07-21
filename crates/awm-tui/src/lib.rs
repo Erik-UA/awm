@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use awm_proto::{AgentId, AgentState, AgentView, LayoutCmd, LineKind, Renderer, Tags, TranscriptLine};
+use awm_pty::{ShellColor, ShellScreen};
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -170,6 +171,12 @@ impl GateView {
 struct Chrome<'a> {
     tick: u64,
     elapsed: &'a HashMap<AgentId, u64>,
+    /// Live terminal grids for shell panes, keyed by pane id. A pane present here
+    /// renders its emulator grid instead of an agent transcript.
+    shells: &'a HashMap<AgentId, ShellScreen>,
+    /// Where `draw_pane` records each shell pane's inner `(rows, cols)` so the
+    /// binary can resize the matching PTY to fit.
+    shell_sizes: &'a std::cell::RefCell<HashMap<AgentId, (u16, u16)>>,
 }
 
 /// The TUI renderer, generic over a ratatui backend.
@@ -179,6 +186,9 @@ pub struct AwmTui<B: Backend> {
     tick: u64,
     /// Per-agent seconds spent in the current active turn (empty in tests).
     elapsed: HashMap<AgentId, u64>,
+    /// Inner `(rows, cols)` each shell pane was drawn at this frame, so the
+    /// binary can resize the matching PTY. Filled during `draw`, read after.
+    shell_sizes: std::cell::RefCell<HashMap<AgentId, (u16, u16)>>,
 }
 
 impl<B: Backend> AwmTui<B> {
@@ -189,7 +199,14 @@ impl<B: Backend> AwmTui<B> {
             terminal: Terminal::new(backend)?,
             tick: 0,
             elapsed: HashMap::new(),
+            shell_sizes: std::cell::RefCell::new(HashMap::new()),
         })
+    }
+
+    /// The inner `(rows, cols)` each shell pane occupied in the last `draw`.
+    /// The binary resizes each shell's PTY to match so full-screen apps line up.
+    pub fn shell_sizes(&self) -> HashMap<AgentId, (u16, u16)> {
+        self.shell_sizes.borrow().clone()
     }
 
     /// Feed the live-status animation/timing for the next `draw`: `tick` is a
@@ -228,12 +245,17 @@ impl<B: Backend> AwmTui<B> {
         gate: Option<&GateView>,
         gate_target: Option<AgentId>,
         tabs: &[Tab],
+        shells: &HashMap<AgentId, ShellScreen>,
     ) -> std::io::Result<()> {
+        // Fresh per-frame; draw_pane refills it for whatever shells are visible.
+        self.shell_sizes.borrow_mut().clear();
         // Borrow the timing fields disjointly from `self.terminal` so the draw
         // closure can carry them without capturing all of `self`.
         let chrome = Chrome {
             tick: self.tick,
             elapsed: &self.elapsed,
+            shells,
+            shell_sizes: &self.shell_sizes,
         };
         self.terminal.draw(|frame| {
             let full = frame.size();
@@ -298,7 +320,20 @@ impl<B: Backend> AwmTui<B> {
 
 impl<B: Backend> Renderer for AwmTui<B> {
     fn render(&mut self, views: &[AgentView], layout: &LayoutCmd) -> std::io::Result<()> {
-        self.draw(views, layout, None, None, 0, false, false, None, None, None, &[])
+        self.draw(
+            views,
+            layout,
+            None,
+            None,
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+            &[],
+            &HashMap::new(),
+        )
     }
 }
 
@@ -500,9 +535,18 @@ fn render_help(frame: &mut Frame, area: Rect) {
         "Agents",
         &[
             ("Ctrl+p", "spawn an agent on this screen"),
+            ("Ctrl+g", "open a shell console on this screen"),
             ("i", "message the focused agent"),
             ("r", "resume a restored (dead) claude pane"),
-            ("Ctrl+x", "kill the focused agent"),
+            ("Ctrl+x", "kill the focused agent / shell"),
+        ],
+    );
+    section(
+        &mut body,
+        "Shell console",
+        &[
+            ("(focused)", "keys type straight into the shell"),
+            ("Ctrl+b", "prefix: next key is an awm hotkey (e.g. Ctrl+b k)"),
         ],
     );
     section(
@@ -843,6 +887,18 @@ fn draw_pane(
     let inner_area = block.inner(area);
     frame.render_widget(&block, area);
 
+    // A shell pane renders its live terminal grid instead of an agent transcript
+    // (no gate/scrollback — the emulator owns the viewport). Record the inner
+    // size so the binary can resize the PTY to match.
+    if let Some(screen) = chrome.shells.get(&view.meta.id) {
+        chrome
+            .shell_sizes
+            .borrow_mut()
+            .insert(view.meta.id, (inner_area.height, inner_area.width));
+        render_shell_grid(frame, inner_area, screen, focused);
+        return;
+    }
+
     // A live gate for THIS pane renders as an inline menu pinned to the bottom
     // (Claude-style): reserve its rows, the transcript takes what's left above.
     let gate = inline.and_then(|(g, t)| (view.meta.id == t).then_some(g));
@@ -892,6 +948,81 @@ fn draw_pane(
         let lines = gate_inline_lines(g, inner, ga.height as usize);
         frame.render_widget(Paragraph::new(lines), ga);
     }
+}
+
+/// Map an emulator color to a ratatui color. `Default` becomes `Reset` so the
+/// terminal's own default shows through.
+fn shell_color(c: ShellColor) -> Color {
+    match c {
+        ShellColor::Default => Color::Reset,
+        ShellColor::Idx(i) => Color::Indexed(i),
+        ShellColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+/// Render a shell pane's terminal grid into `area`. Cells are coalesced into
+/// style-runs per row for efficiency; the cursor cell is reversed when the pane
+/// is focused and the cursor is visible. The grid is clipped to `area`.
+fn render_shell_grid(frame: &mut Frame, area: Rect, screen: &ShellScreen, focused: bool) {
+    let rows = (screen.rows).min(area.height);
+    let cols = (screen.cols).min(area.width);
+    let show_cursor = focused && !screen.hide_cursor;
+    let (cur_row, cur_col) = screen.cursor;
+
+    let mut lines: Vec<Line> = Vec::with_capacity(rows as usize);
+    for r in 0..rows {
+        let mut spans: Vec<Span> = Vec::new();
+        let mut run = String::new();
+        let mut run_style = Style::default();
+        for c in 0..cols {
+            let cell = screen.cell(r, c);
+            let (text, mut style) = match cell {
+                Some(cell) => {
+                    let mut style = Style::default()
+                        .fg(shell_color(cell.fg))
+                        .bg(shell_color(cell.bg));
+                    if cell.bold {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    if cell.italic {
+                        style = style.add_modifier(Modifier::ITALIC);
+                    }
+                    if cell.underline {
+                        style = style.add_modifier(Modifier::UNDERLINED);
+                    }
+                    if cell.inverse {
+                        style = style.add_modifier(Modifier::REVERSED);
+                    }
+                    let text = if cell.contents.is_empty() {
+                        " ".to_string()
+                    } else {
+                        cell.contents.clone()
+                    };
+                    (text, style)
+                }
+                None => (" ".to_string(), Style::default()),
+            };
+            // The cursor cell is drawn reversed so it stands out (block cursor).
+            if show_cursor && r == cur_row && c == cur_col {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            // Coalesce consecutive same-styled cells into one span.
+            if style == run_style {
+                run.push_str(&text);
+            } else {
+                if !run.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut run), run_style));
+                }
+                run = text;
+                run_style = style;
+            }
+        }
+        if !run.is_empty() {
+            spans.push(Span::styled(run, run_style));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// The live decision menu rendered INLINE at the bottom of a pane (Claude-style):
@@ -1552,6 +1683,7 @@ mod tests {
             None,
             None,
             &[],
+            &HashMap::new(),
         )
         .unwrap();
         insta::assert_snapshot!("card_populated", buffer_to_string(tui.backend()));
@@ -1574,6 +1706,7 @@ mod tests {
             None,
             None,
             &[],
+            &HashMap::new(),
         )
         .unwrap();
         assert!(buffer_to_string(tui.backend()).contains("no metadata yet"));

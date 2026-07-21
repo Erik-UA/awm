@@ -12,9 +12,10 @@ use std::io::stdout;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use awm_core::session::PaneKind;
 use awm_core::{plan_layout, Engine, LayoutMode};
-use awm_pty::{CommandSpec, Decision};
-use awm_proto::{AgentId, AgentState, LineKind, Renderer, Tags, TranscriptLine};
+use awm_pty::{CommandSpec, Decision, ShellSession};
+use awm_proto::{AgentId, AgentMeta, AgentState, LineKind, Renderer, Tags, TranscriptLine};
 use awm_tui::keymap::{map_key, Action};
 use awm_tui::AwmTui;
 
@@ -864,6 +865,15 @@ fn run_probe_resume() -> std::io::Result<()> {
 fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
     let mut engine = Engine::new();
 
+    // Live shell-console PTYs, keyed by pane id. These bypass the stream-json
+    // `Engine` entirely — the registry only tracks a lightweight `Shell` record
+    // (for focus/layout/persistence); the process + emulator grid live here.
+    let mut shells: std::collections::HashMap<AgentId, ShellSession> =
+        std::collections::HashMap::new();
+    // One-shot `Ctrl+b` escape: when armed, the next key is an awm hotkey even if
+    // a shell pane is focused (tmux-style prefix).
+    let mut prefix_pending = false;
+
     // Restore a saved session (projects + panes as read-only history) unless the
     // user asked for a clean start or there is nothing saved. Otherwise, name the
     // default project after cwd and spawn the initial roster.
@@ -875,6 +885,16 @@ fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
         // have no session_id → they stay as read-only history; sub-agent panes
         // share the root process and are recreated when the resumed root works.
         for snap in &state.agents {
+            // A shell can't resume its process — open a FRESH one in its saved
+            // cwd (prior scrollback is dropped; the restored record is history).
+            if snap.kind == PaneKind::Shell {
+                let spec = CommandSpec::new(shell_program(), snap.meta.cwd.clone());
+                if let Ok(sh) = ShellSession::spawn(&spec, SHELL_ROWS, SHELL_COLS) {
+                    engine.registry_mut().reactivate(snap.meta.id);
+                    shells.insert(snap.meta.id, sh);
+                }
+                continue;
+            }
             if snap.is_subagent || !snap.resumable {
                 continue; // mocks (not resumable) stay as read-only history
             }
@@ -1023,7 +1043,25 @@ fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
                         }
                         _ => {}
                     }
+                } else if engine
+                    .registry()
+                    .focus()
+                    .is_some_and(|f| shells.contains_key(&f))
+                    && !prefix_pending
+                {
+                    // Shell passthrough: the focused pane is a live shell, so
+                    // keystrokes go straight to its PTY. `Ctrl+b` arms a one-shot
+                    // escape (handled below) so the NEXT key is an awm hotkey.
+                    let fid = engine.registry().focus().unwrap();
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    if ctrl && matches!(key.code, KeyCode::Char('b')) {
+                        prefix_pending = true;
+                    } else if let Some(sh) = shells.get_mut(&fid) {
+                        let _ = sh.write(&encode_key(&key));
+                    }
                 } else {
+                    // Reaching command mode consumes any armed shell escape.
+                    prefix_pending = false;
                     // Layout-independent hotkeys: when a Cyrillic layout is
                     // active, map the char back to its QWERTY-position Latin
                     // key (Ctrl+о → Ctrl+j, etc.). The picker filter and text
@@ -1115,7 +1153,14 @@ fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
                         }
                         KeyCode::Char('x') if ctrl => {
                             if let Some(f) = engine.registry().focus() {
-                                engine.kill(f);
+                                // A shell pane: kill its PTY and drop the record.
+                                // An agent: the usual Engine kill path.
+                                if let Some(mut sh) = shells.remove(&f) {
+                                    let _ = sh.kill();
+                                    engine.registry_mut().remove(f);
+                                } else {
+                                    engine.kill(f);
+                                }
                                 dirty = true;
                             }
                         }
@@ -1130,6 +1175,13 @@ fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
                                 match action {
                                     Action::SpawnPrompt => {
                                         input = Some(Input::Spawn(String::new()))
+                                    }
+                                    // Open an interactive shell console pane in
+                                    // the active project's folder and focus it.
+                                    Action::SpawnShell => {
+                                        spawn_shell(&mut engine, &mut shells);
+                                        scroll = 0;
+                                        dirty = true;
                                     }
                                     // Scrollback of the focused pane (Track A
                                     // refines clamping to content height).
@@ -1203,6 +1255,23 @@ fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
         }
 
         engine.pump();
+
+        // Reap shells whose process exited (user typed `exit`) or whose record
+        // was removed elsewhere (e.g. a project close), killing orphan PTYs.
+        let mut gone: Vec<AgentId> = Vec::new();
+        for (id, sh) in shells.iter_mut() {
+            if sh.has_exited() || engine.registry().record(*id).is_none() {
+                gone.push(*id);
+            }
+        }
+        for id in gone {
+            if let Some(mut sh) = shells.remove(&id) {
+                let _ = sh.kill();
+            }
+            engine.registry_mut().remove(id);
+            dirty = true;
+        }
+
         let layout = plan_layout(engine.registry(), mode);
         let views = engine.registry().views();
         let focus = engine.registry().focus();
@@ -1295,6 +1364,13 @@ fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
         work_since.retain(|id, _| active.contains(id));
         tui.set_chrome(tick, elapsed);
 
+        // Snapshot each live shell's terminal grid for rendering.
+        let mut screens: std::collections::HashMap<AgentId, awm_pty::ShellScreen> =
+            std::collections::HashMap::new();
+        for (id, sh) in &shells {
+            screens.insert(*id, sh.snapshot());
+        }
+
         tui.draw(
             &views,
             &layout,
@@ -1307,7 +1383,16 @@ fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
             gate.as_ref(),
             gate_target,
             &tabs,
+            &screens,
         )?;
+
+        // Resize each shell's PTY to the pane it was just drawn in, so
+        // full-screen apps (vim, htop) match the visible geometry.
+        for (id, (rows, cols)) in tui.shell_sizes() {
+            if let Some(sh) = shells.get_mut(&id) {
+                let _ = sh.resize(rows.max(1), cols.max(1));
+            }
+        }
 
         // Persist immediately after a structural change, else on a ~5s heartbeat
         // (so growing transcripts survive a crash between structural edits).
@@ -1319,6 +1404,9 @@ fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
     }
     // Final save captures the last transcripts before we tear down processes.
     save_session(&engine);
+    for sh in shells.values_mut() {
+        let _ = sh.kill(); // don't leave shell PTYs running after awm exits
+    }
     engine.shutdown();
     Ok(())
 }
@@ -1482,6 +1570,73 @@ fn askq_decision(ctx: &awm_proto::ApprovalCtx, chosen: &[Vec<usize>]) -> Decisio
     match serde_json::to_string(&updated) {
         Ok(s) => Decision::AllowWith(s),
         Err(_) => Decision::Allow,
+    }
+}
+
+/// Initial PTY size for a freshly-spawned shell. Corrected to the real pane
+/// size on the first frame via `AwmTui::shell_sizes` (see the resize step).
+const SHELL_ROWS: u16 = 24;
+const SHELL_COLS: u16 = 80;
+
+/// The program a shell pane runs: the user's `$SHELL`, falling back to `bash`.
+fn shell_program() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "bash".into())
+}
+
+/// Open a fresh interactive shell pane in the active project's folder, focus it,
+/// and register its PTY in `shells`. Drops the pane if the shell fails to spawn.
+fn spawn_shell(engine: &mut Engine, shells: &mut std::collections::HashMap<AgentId, ShellSession>) {
+    let cwd = active_project_cwd(engine);
+    let id = engine.registry_mut().alloc_id();
+    engine
+        .registry_mut()
+        .add_shell(AgentMeta::new(id, "shell", cwd.clone(), 0));
+    engine.registry_mut().set_focus(id);
+    let spec = CommandSpec::new(shell_program(), cwd);
+    match ShellSession::spawn(&spec, SHELL_ROWS, SHELL_COLS) {
+        Ok(sh) => {
+            shells.insert(id, sh);
+        }
+        Err(_) => {
+            engine.registry_mut().remove(id); // don't leave a dead pane behind
+        }
+    }
+}
+
+/// Encode a key press into the bytes a PTY shell expects on stdin. Printable
+/// chars pass through as UTF-8; control chars, Enter/Backspace/Tab and the arrow/
+/// navigation keys map to their terminal escape sequences.
+fn encode_key(key: &crossterm::event::KeyEvent) -> Vec<u8> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char(c) => {
+            if ctrl {
+                // Ctrl+<letter> → the corresponding C0 control byte (Ctrl+C = 0x03).
+                vec![(c as u8) & 0x1f]
+            } else {
+                let mut buf = [0u8; 4];
+                c.encode_utf8(&mut buf).as_bytes().to_vec()
+            }
+        }
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Up => vec![0x1b, b'[', b'A'],
+        KeyCode::Down => vec![0x1b, b'[', b'B'],
+        KeyCode::Right => vec![0x1b, b'[', b'C'],
+        KeyCode::Left => vec![0x1b, b'[', b'D'],
+        KeyCode::Home => vec![0x1b, b'[', b'H'],
+        KeyCode::End => vec![0x1b, b'[', b'F'],
+        KeyCode::PageUp => vec![0x1b, b'[', b'5', b'~'],
+        KeyCode::PageDown => vec![0x1b, b'[', b'6', b'~'],
+        KeyCode::Delete => vec![0x1b, b'[', b'3', b'~'],
+        KeyCode::Insert => vec![0x1b, b'[', b'2', b'~'],
+        _ => Vec::new(),
     }
 }
 

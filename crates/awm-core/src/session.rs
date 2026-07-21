@@ -15,6 +15,17 @@ use serde::{Deserialize, Serialize};
 /// Bump when the on-disk shape changes incompatibly.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// What kind of pane a snapshot/record represents. New panes default to
+/// [`PaneKind::Agent`] so old (v1, field-less) sessions keep deserializing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PaneKind {
+    /// A Claude agent driven by the stream-json runtime.
+    #[default]
+    Agent,
+    /// An interactive shell console (raw PTY, re-spawned fresh on restore).
+    Shell,
+}
+
 /// A single agent pane, frozen for persistence.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentSnapshot {
@@ -38,6 +49,10 @@ pub struct AgentSnapshot {
     /// are re-attached via `claude --resume` on restore.
     #[serde(default)]
     pub resumable: bool,
+    /// Whether this pane is an agent or an interactive shell. Shells are
+    /// re-spawned fresh in `meta.cwd` on restore (they cannot resume state).
+    #[serde(default)]
+    pub kind: PaneKind,
 }
 
 /// A whole `awm` session: its projects, the active one, and every agent pane.

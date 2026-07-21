@@ -25,6 +25,8 @@ pub enum Action {
     NewProject,
     /// `Mod+w` — close the active project (screen) and its agents.
     CloseProject,
+    /// `Mod+g` — open an interactive shell console pane in the active project.
+    SpawnShell,
     /// `y` / `n` on an urgent agent — approve / deny the pending request.
     Approve,
     Deny,
@@ -61,6 +63,7 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('n') if ctrl => Some(Action::NewProject),
         KeyCode::Char('o') if ctrl => Some(Action::NextProject),
         KeyCode::Char('w') if ctrl => Some(Action::CloseProject),
+        KeyCode::Char('g') if ctrl => Some(Action::SpawnShell),
         KeyCode::Char(c @ '1'..='9') if ctrl => Some(Action::SwitchProject(c as u8 - b'0')),
 
         // Bare approval keys (meaningful on an urgent, focused agent).

@@ -393,6 +393,7 @@ fn restore_then_resume_attaches_live_process_to_existing_pane() {
             session_id: Some("s-mock".into()),
             is_subagent: false,
             resumable: true,
+            kind: awm_core::session::PaneKind::Agent,
         }],
     };
 

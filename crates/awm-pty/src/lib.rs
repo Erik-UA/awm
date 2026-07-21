@@ -195,6 +195,219 @@ fn push_line(ring: &Arc<Mutex<VecDeque<String>>>, line: &mut Vec<u8>, cap: usize
     }
 }
 
+// ---------------------------------------------------------------------------
+// Interactive shell pane (Track A, full terminal emulation).
+//
+// Unlike `PtySession` (a read-only line-ring capture), `ShellSession` is a
+// bidirectional, cursor-addressed terminal: raw PTY bytes are fed into a
+// `vt100::Parser` grid and keystrokes are written back to the child's stdin.
+// The grid is exposed as the emulator-free [`ShellScreen`] snapshot so `vt100`
+// never leaks past this crate.
+// ---------------------------------------------------------------------------
+
+/// Lines of scrollback the emulator keeps beyond the visible screen.
+const SHELL_SCROLLBACK: usize = 0;
+
+/// A foreground/background color, mirroring `vt100::Color` so callers need not
+/// depend on `vt100`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ShellColor {
+    /// The terminal's default color.
+    #[default]
+    Default,
+    /// An indexed (palette) color, 0..=255.
+    Idx(u8),
+    /// A true-color RGB triple.
+    Rgb(u8, u8, u8),
+}
+
+fn conv_color(c: vt100::Color) -> ShellColor {
+    match c {
+        vt100::Color::Default => ShellColor::Default,
+        vt100::Color::Idx(i) => ShellColor::Idx(i),
+        vt100::Color::Rgb(r, g, b) => ShellColor::Rgb(r, g, b),
+    }
+}
+
+/// One rendered terminal cell. `contents` is the cell's grapheme (empty for a
+/// blank cell or a wide-char continuation column).
+#[derive(Clone, Debug, Default)]
+pub struct ShellCell {
+    pub contents: String,
+    pub fg: ShellColor,
+    pub bg: ShellColor,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+}
+
+/// An emulator-free snapshot of the terminal grid: `rows * cols` cells in
+/// row-major order, plus the cursor position and visibility.
+#[derive(Clone, Debug)]
+pub struct ShellScreen {
+    pub rows: u16,
+    pub cols: u16,
+    /// Cursor `(row, col)`.
+    pub cursor: (u16, u16),
+    pub hide_cursor: bool,
+    /// `rows * cols` cells, row-major (row 0 first).
+    pub cells: Vec<ShellCell>,
+}
+
+impl ShellScreen {
+    /// The cell at `(row, col)`, or `None` if out of bounds.
+    pub fn cell(&self, row: u16, col: u16) -> Option<&ShellCell> {
+        if row >= self.rows || col >= self.cols {
+            return None;
+        }
+        self.cells.get(row as usize * self.cols as usize + col as usize)
+    }
+}
+
+/// A bidirectional PTY-backed interactive shell with a full `vt100` terminal
+/// emulator. Raw output bytes drive the grid; [`ShellSession::write`] forwards
+/// keystrokes to the child. Render via [`ShellSession::snapshot`].
+pub struct ShellSession {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Box<dyn std::io::Write + Send>,
+    parser: Arc<Mutex<vt100::Parser>>,
+    /// Owns the output-pump thread for the session's lifetime; detached on drop
+    /// (the thread ends on its own when the child closes the PTY).
+    _reader: JoinHandle<()>,
+    exited: bool,
+}
+
+impl ShellSession {
+    /// Spawn `spec` in a new `rows`x`cols` PTY with terminal emulation.
+    pub fn spawn(spec: &CommandSpec, rows: u16, cols: u16) -> std::io::Result<Self> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(other_err)?;
+
+        let mut cmd = CommandBuilder::new(&spec.program);
+        for a in &spec.args {
+            cmd.arg(a);
+        }
+        cmd.cwd(&spec.cwd);
+        // A sane TERM so full-screen apps (vim, htop) emit escapes vt100 groks.
+        cmd.env("TERM", "xterm-256color");
+        for (k, v) in &spec.env {
+            cmd.env(k, v);
+        }
+
+        let child = pair.slave.spawn_command(cmd).map_err(other_err)?;
+        // Drop the slave so the reader sees EOF once the child exits.
+        drop(pair.slave);
+
+        let writer = pair.master.take_writer().map_err(other_err)?;
+        let reader_handle = pair.master.try_clone_reader().map_err(other_err)?;
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SHELL_SCROLLBACK)));
+        let parser_for_thread = Arc::clone(&parser);
+        let reader = std::thread::spawn(move || {
+            pump_bytes(reader_handle, parser_for_thread);
+        });
+
+        Ok(ShellSession {
+            master: pair.master,
+            child,
+            writer,
+            parser,
+            _reader: reader,
+            exited: false,
+        })
+    }
+
+    /// Forward raw bytes (encoded keystrokes) to the child's stdin.
+    pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.writer.write_all(bytes)?;
+        self.writer.flush()
+    }
+
+    /// Resize both the PTY window and the emulator grid.
+    pub fn resize(&mut self, rows: u16, cols: u16) -> std::io::Result<()> {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(other_err)?;
+        self.parser.lock().unwrap().screen_mut().set_size(rows, cols);
+        Ok(())
+    }
+
+    /// Snapshot the current terminal grid into an emulator-free [`ShellScreen`].
+    pub fn snapshot(&self) -> ShellScreen {
+        let guard = self.parser.lock().unwrap();
+        let screen = guard.screen();
+        let (rows, cols) = screen.size();
+        let mut cells = Vec::with_capacity(rows as usize * cols as usize);
+        for r in 0..rows {
+            for c in 0..cols {
+                let cell = match screen.cell(r, c) {
+                    Some(cell) => ShellCell {
+                        contents: cell.contents().to_string(),
+                        fg: conv_color(cell.fgcolor()),
+                        bg: conv_color(cell.bgcolor()),
+                        bold: cell.bold(),
+                        italic: cell.italic(),
+                        underline: cell.underline(),
+                        inverse: cell.inverse(),
+                    },
+                    None => ShellCell::default(),
+                };
+                cells.push(cell);
+            }
+        }
+        let cursor = screen.cursor_position();
+        ShellScreen {
+            rows,
+            cols,
+            cursor,
+            hide_cursor: screen.hide_cursor(),
+            cells,
+        }
+    }
+
+    /// Whether the child has exited (non-blocking).
+    pub fn has_exited(&mut self) -> bool {
+        if self.exited {
+            return true;
+        }
+        if let Ok(Some(_)) = self.child.try_wait() {
+            self.exited = true;
+        }
+        self.exited
+    }
+
+    /// Terminate the child.
+    pub fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill().map_err(other_err)
+    }
+}
+
+/// Read `reader` to EOF, feeding every chunk into the `vt100` parser grid.
+fn pump_bytes(mut reader: Box<dyn Read + Send>, parser: Arc<Mutex<vt100::Parser>>) {
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => parser.lock().unwrap().process(&buf[..n]),
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
 /// A permission decision for a pending `can_use_tool` control_request.
 ///
 /// This is the *intent* (approve / deny). The concrete `updatedInput` echoed on
@@ -467,5 +680,53 @@ mod tests {
             !buf.contains("post-approval-tool-result"),
             "agent must not proceed after deny; stream: {buf}"
         );
+    }
+
+    /// Flatten a grid snapshot into a single string for substring assertions.
+    fn screen_text(screen: &ShellScreen) -> String {
+        let mut out = String::new();
+        for r in 0..screen.rows {
+            for c in 0..screen.cols {
+                match screen.cell(r, c) {
+                    Some(cell) if !cell.contents.is_empty() => out.push_str(&cell.contents),
+                    _ => out.push(' '),
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// A shell session echoes a typed command's output into the emulator grid.
+    #[test]
+    fn shell_session_captures_command_output() {
+        let spec = CommandSpec::new("sh", std::env::temp_dir());
+        let mut sh = ShellSession::spawn(&spec, 24, 80).unwrap();
+        sh.write(b"echo shellmarker\n").unwrap();
+
+        // The reader thread feeds the PTY asynchronously; poll the grid.
+        let mut found = false;
+        for _ in 0..200 {
+            if screen_text(&sh.snapshot()).contains("shellmarker") {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = sh.kill();
+        assert!(found, "expected 'shellmarker' in the emulator grid");
+    }
+
+    /// Resizing updates the reported grid dimensions.
+    #[test]
+    fn shell_session_resize_changes_grid_size() {
+        let spec = CommandSpec::new("sh", std::env::temp_dir());
+        let mut sh = ShellSession::spawn(&spec, 24, 80).unwrap();
+        assert_eq!((sh.snapshot().rows, sh.snapshot().cols), (24, 80));
+        sh.resize(10, 40).unwrap();
+        let snap = sh.snapshot();
+        assert_eq!((snap.rows, snap.cols), (10, 40));
+        assert_eq!(snap.cells.len(), 10 * 40);
+        let _ = sh.kill();
     }
 }

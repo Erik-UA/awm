@@ -6,11 +6,39 @@ use awm_proto::{
     AgentId, AgentMeta, AgentState, AgentView, LayoutCmd, LineKind, Renderer, Tags, TokenUsage,
     TranscriptLine,
 };
+use awm_pty::ShellScreen;
 use awm_tui::AwmTui;
 use ratatui::backend::TestBackend;
+use std::collections::HashMap;
 
 fn tl(kind: LineKind, text: &str) -> TranscriptLine {
     TranscriptLine::new(kind, text)
+}
+
+/// No shell panes — the trailing `draw` argument for the agent-only snapshots.
+fn no_shells() -> HashMap<AgentId, ShellScreen> {
+    HashMap::new()
+}
+
+/// A one-row terminal grid holding `text`, padded to `cols`.
+fn shell_screen(text: &str, cols: u16) -> ShellScreen {
+    use awm_pty::ShellCell;
+    let mut cells: Vec<ShellCell> = Vec::with_capacity(cols as usize);
+    let mut chars = text.chars();
+    for _ in 0..cols {
+        let mut cell = ShellCell::default();
+        if let Some(ch) = chars.next() {
+            cell.contents = ch.to_string();
+        }
+        cells.push(cell);
+    }
+    ShellScreen {
+        rows: 1,
+        cols,
+        cursor: (0, text.chars().count() as u16),
+        hide_cursor: false,
+        cells,
+    }
 }
 
 fn sample_views() -> Vec<AgentView> {
@@ -196,11 +224,27 @@ fn tall_transcript_autoscrolls_to_bottom() {
         None,
         None,
         &[],
+        &no_shells(),
     )
     .unwrap();
     let top = buffer_to_string(tui.backend());
     assert!(top.contains("L00"), "oldest line must be visible at the top:\n{top}");
     assert!(!top.contains("L29"), "newest line must be off-screen at the top:\n{top}");
+}
+
+#[test]
+fn shell_pane_renders_grid_instead_of_transcript() {
+    // A pane present in the shells map draws its terminal grid, not `view.tail`.
+    let views = sample_views();
+    let id = views[0].meta.id;
+    let mut shells = HashMap::new();
+    shells.insert(id, shell_screen("$ echo shellmarker", 60));
+
+    let mut tui = AwmTui::new(TestBackend::new(64, 12)).unwrap();
+    tui.draw(&views, &LayoutCmd::Monocle(id), Some(id),
+             None, 0, false, false, None, None, None, &[], &shells).unwrap();
+    let out = buffer_to_string(tui.backend());
+    assert!(out.contains("shellmarker"), "shell grid text must render:\n{out}");
 }
 
 #[test]
@@ -225,7 +269,7 @@ fn project_tab_bar_marks_active_and_urgent() {
         Tab { name: "web".into(), active: false, urgent: true },
         Tab { name: "docs".into(), active: false, urgent: false },
     ];
-    tui.draw(&views, &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)), None, 0, false, false, None, None, None, &tabs)
+    tui.draw(&views, &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)), None, 0, false, false, None, None, None, &tabs, &no_shells())
         .unwrap();
     let out = buffer_to_string(tui.backend());
     let top = out.lines().next().unwrap_or_default();
@@ -241,7 +285,7 @@ fn no_tabs_keeps_layout_unchanged() {
     // pre-projects layout — this is what the other snapshots rely on).
     let mut tui = AwmTui::new(TestBackend::new(40, 8)).unwrap();
     let views = sample_views();
-    tui.draw(&views, &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)), None, 0, false, false, None, None, None, &[])
+    tui.draw(&views, &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)), None, 0, false, false, None, None, None, &[], &no_shells())
         .unwrap();
     let out = buffer_to_string(tui.backend());
     let top = out.lines().next().unwrap_or_default();
@@ -250,11 +294,11 @@ fn no_tabs_keeps_layout_unchanged() {
 
 #[test]
 fn help_overlay_lists_key_sections() {
-    let mut tui = AwmTui::new(TestBackend::new(70, 30)).unwrap();
+    let mut tui = AwmTui::new(TestBackend::new(70, 40)).unwrap();
     tui.draw(&sample_views(), &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)),
-             None, 0, false, true, None, None, None, &[]).unwrap();
+             None, 0, false, true, None, None, None, &[], &no_shells()).unwrap();
     let out = buffer_to_string(tui.backend());
-    for needle in ["keybindings", "Screens", "Ctrl+w", "Ctrl+n", "close active", "quit"] {
+    for needle in ["keybindings", "Screens", "Ctrl+w", "Ctrl+n", "close active", "Ctrl+g", "quit"] {
         assert!(out.contains(needle), "help overlay missing {needle:?}:\n{out}");
     }
 }
@@ -270,7 +314,7 @@ fn picker_overlay_lists_dirs_and_legend() {
     };
     let mut tui = AwmTui::new(TestBackend::new(70, 14)).unwrap();
     tui.draw(&sample_views(), &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)),
-             None, 0, false, false, Some(&pv), None, None, &[]).unwrap();
+             None, 0, false, false, Some(&pv), None, None, &[], &no_shells()).unwrap();
     let out = buffer_to_string(tui.backend());
     assert!(out.contains("prototupe"), "title path:\n{out}");
     assert!(out.contains("find: cr"), "active filter shown in title:\n{out}");
@@ -303,7 +347,7 @@ fn gate_overlay_renders_plan_and_single_select() {
     };
     let mut tui = AwmTui::new(TestBackend::new(60, 12)).unwrap();
     tui.draw(&sample_views(), &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)),
-             None, 0, false, false, None, Some(&gv), None, &[]).unwrap();
+             None, 0, false, false, None, Some(&gv), None, &[], &no_shells()).unwrap();
     let out = buffer_to_string(tui.backend());
     assert!(out.contains("ExitPlanMode"), "gate title:\n{out}");
     assert!(out.contains("Plan: port the gate"), "markdown body:\n{out}");
@@ -335,7 +379,7 @@ fn gate_inline_renders_menu_inside_the_pane() {
     // gate + gate_target set → the menu renders INLINE in that agent's pane
     // (not as a full-screen overlay).
     tui.draw(&views, &LayoutCmd::Monocle(id), Some(id),
-             None, 0, false, false, None, Some(&gv), Some(id), &[]).unwrap();
+             None, 0, false, false, None, Some(&gv), Some(id), &[], &no_shells()).unwrap();
     let out = buffer_to_string(tui.backend());
     assert!(out.contains("Do you prefer TABS or SPACES?"), "question inline:\n{out}");
     assert!(out.contains("Tabs"), "first option:\n{out}");
@@ -375,7 +419,7 @@ fn gate_inline_renders_two_question_groups() {
     let id = views[0].meta.id;
     let mut tui = AwmTui::new(TestBackend::new(72, 20)).unwrap();
     tui.draw(&views, &LayoutCmd::Monocle(id), Some(id),
-             None, 0, false, false, None, Some(&gv), Some(id), &[]).unwrap();
+             None, 0, false, false, None, Some(&gv), Some(id), &[], &no_shells()).unwrap();
     let out = buffer_to_string(tui.backend());
     // BOTH groups render (headers + options) — the multi-question fix.
     assert!(out.contains("Group 1") && out.contains("Group 2"), "both headers:\n{out}");
@@ -408,7 +452,7 @@ fn gate_overlay_multi_select_shows_checkboxes() {
     };
     let mut tui = AwmTui::new(TestBackend::new(60, 8)).unwrap();
     tui.draw(&sample_views(), &LayoutCmd::SetMaster(AgentId(0)), Some(AgentId(0)),
-             None, 0, false, false, None, Some(&gv), None, &[]).unwrap();
+             None, 0, false, false, None, Some(&gv), None, &[], &no_shells()).unwrap();
     let out = buffer_to_string(tui.backend());
     assert!(out.contains("[ ] cargo build"), "unchecked box:\n{out}");
     assert!(out.contains("[x] cargo test"), "checked box:\n{out}");

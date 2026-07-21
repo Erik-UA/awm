@@ -8,6 +8,7 @@ description = "Ratatui rendering + keymap for awm (Track C). Phase 2."
 
 [dependencies]
 awm-proto = { workspace = true }
+awm-pty = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 
