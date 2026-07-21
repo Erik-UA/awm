@@ -1198,7 +1198,11 @@ fn run_interactive(roster: Vec<Spawn>, fresh: bool) -> std::io::Result<()> {
                                     let _ = sh.kill();
                                     engine.registry_mut().remove(f);
                                 } else {
-                                    engine.kill(f);
+                                    // Kills the process (if any) AND retires the
+                                    // pane + its sub-agent panes. A bare kill()
+                                    // left agent panes lingering and was a no-op
+                                    // on sub-agents (no process of their own).
+                                    engine.close_agent(f);
                                 }
                                 dirty = true;
                             }

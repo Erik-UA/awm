@@ -163,6 +163,39 @@ impl Engine {
         }
     }
 
+    /// Close a single focused agent pane: SIGTERM its process (a no-op for a
+    /// sub-agent pane, which shares the root process), retire any sub-agent panes
+    /// it owns, drop the pane, and clean the parent/child bookkeeping. Focus
+    /// re-points via [`Registry::remove`].
+    ///
+    /// A sub-agent has no process of its own, so closing its pane is a UI dismiss:
+    /// the pane and its bookkeeping go away and further output falls back to the
+    /// root pane; the inner work (running inside the root) is not force-stopped.
+    /// Closing a top-level agent kills the real process and takes its sub-agent
+    /// panes with it — they can't outlive it — mirroring the `Finished` cleanup.
+    pub fn close_agent(&mut self, id: AgentId) {
+        // Retire descendant sub-agent panes (they share the process being killed).
+        if let Some(children) = self.descendants.remove(&id) {
+            let removed: HashSet<AgentId> = children.iter().copied().collect();
+            for child in children {
+                self.reg.remove(child);
+            }
+            self.child_by_tool.retain(|_, v| !removed.contains(v));
+            self.parent_of.retain(|c, _| !removed.contains(c));
+            self.tool_owner.retain(|_, v| !removed.contains(v));
+        }
+        // If this pane is itself a sub-agent, detach it from its parent's maps.
+        if self.parent_of.remove(&id).is_some() {
+            if let Some(v) = self.descendants.values_mut().find(|v| v.contains(&id)) {
+                v.retain(|c| *c != id);
+            }
+            self.child_by_tool.retain(|_, v| *v != id);
+            self.tool_owner.retain(|_, v| *v != id);
+        }
+        self.kill(id); // SIGTERM if it has a live process; no-op otherwise
+        self.reg.remove(id); // drop the pane + re-point focus
+    }
+
     /// Start a process for `spec`, wire its answerer/pid, and spawn the reader
     /// thread that forwards its events tagged with `id`. Shared by spawn/resume.
     fn attach(
@@ -650,6 +683,67 @@ mod tests {
         assert!(!engine.registry().order().contains(&child), "child retired on exit");
         assert!(engine.child_by_tool.is_empty());
         assert!(engine.parent_of.is_empty());
+    }
+
+    /// `close_agent` on a sub-agent pane dismisses only that pane and its
+    /// bookkeeping; the root and its other sub-agent survive (sub-agents have no
+    /// process, so nothing is SIGTERMed).
+    #[test]
+    fn close_agent_on_subagent_drops_only_that_pane() {
+        let mut engine = Engine::new();
+        let root = engine.registry_mut().alloc_id();
+        engine
+            .registry_mut()
+            .add(AgentMeta::new(root, "root", PathBuf::from("/tmp"), 0));
+
+        for (tid, desc) in [("toolu_a1", "parser"), ("toolu_a2", "core")] {
+            engine.route(ev(
+                root,
+                AgentEvent::ToolStarted { name: "Agent".into(), summary: desc.into(), input: None },
+                None,
+                Some(Spawn { tool_use_id: tid.into(), description: desc.into() }),
+            ));
+        }
+        let child1 = *engine.child_by_tool.get("toolu_a1").unwrap();
+        let child2 = *engine.child_by_tool.get("toolu_a2").unwrap();
+
+        engine.close_agent(child1);
+
+        assert!(!engine.registry().order().contains(&child1), "child1 dismissed");
+        assert!(engine.registry().order().contains(&root), "root survives");
+        assert!(engine.registry().order().contains(&child2), "sibling survives");
+        // child1's maps are cleaned; child2's are intact.
+        assert!(!engine.parent_of.contains_key(&child1));
+        assert!(!engine.child_by_tool.values().any(|v| *v == child1));
+        assert_eq!(engine.descendants.get(&root), Some(&vec![child2]));
+        assert_eq!(engine.parent_of.get(&child2), Some(&root));
+    }
+
+    /// `close_agent` on a top-level agent retires its sub-agent panes with it (they
+    /// share the killed process) and leaves the routing maps empty.
+    #[test]
+    fn close_agent_on_root_retires_its_subagents() {
+        let mut engine = Engine::new();
+        let root = engine.registry_mut().alloc_id();
+        engine
+            .registry_mut()
+            .add(AgentMeta::new(root, "root", PathBuf::from("/tmp"), 0));
+
+        engine.route(ev(
+            root,
+            AgentEvent::ToolStarted { name: "Agent".into(), summary: "bg".into(), input: None },
+            None,
+            Some(Spawn { tool_use_id: "toolu_1".into(), description: "bg".into() }),
+        ));
+        let child = *engine.child_by_tool.get("toolu_1").unwrap();
+
+        engine.close_agent(root);
+
+        assert!(!engine.registry().order().contains(&root), "root removed");
+        assert!(!engine.registry().order().contains(&child), "sub-agent removed with it");
+        assert!(engine.child_by_tool.is_empty());
+        assert!(engine.parent_of.is_empty());
+        assert!(engine.descendants.is_empty());
     }
 
     /// Two sub-agents each blocking on a gate: each approval must land in its OWN
