@@ -1103,21 +1103,48 @@ fn draw_empty(frame: &mut Frame, area: Rect) {
 
 /// Render one transcript line to styled ratatui line(s), Claude Code-style:
 /// green `⏺` tool calls, dim `⎿` results (red on error), and markdown for text.
+/// Strip control characters that corrupt the display when written verbatim.
+/// ratatui passes a span's bytes straight to the terminal, so a stray ESC / CR /
+/// backspace in an agent's tool output moves the real cursor and spills content
+/// past pane borders (very visible once panes are narrow, i.e. several agents).
+/// Tabs expand to spaces (ratatui under-counts their width, the terminal over-
+/// draws them); other C0/C1 controls are dropped; `\n` is kept so callers can
+/// still split a run into rows.
+fn sanitize_tui_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\n' => out.push('\n'),
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {} // drop ESC, CR, BS, DEL, C1, …
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn render_transcript_line(tl: &TranscriptLine, width: usize) -> Vec<Line<'static>> {
-    let plain = |text: &str, style: Style| vec![Line::from(Span::styled(text.to_string(), style))];
+    let text = sanitize_tui_text(&tl.text);
+    // One styled `Line` per physical row: a `\n` embedded in a single span would
+    // itself be emitted verbatim and break the layout, so split defensively.
+    let plain = |text: &str, style: Style| {
+        text.split('\n')
+            .map(|l| Line::from(Span::styled(l.to_string(), style)))
+            .collect::<Vec<Line<'static>>>()
+    };
     match tl.kind {
-        LineKind::Text => markdown_lines(&tl.text, width),
-        LineKind::ToolCall => plain(&tl.text, Style::default().fg(Color::Green)),
-        LineKind::ToolResult => plain(&tl.text, Style::default().fg(Color::DarkGray)),
-        LineKind::ToolError => plain(&tl.text, Style::default().fg(Color::Red)),
+        LineKind::Text => markdown_lines(&text, width),
+        LineKind::ToolCall => plain(&text, Style::default().fg(Color::Green)),
+        LineKind::ToolResult => plain(&text, Style::default().fg(Color::DarkGray)),
+        LineKind::ToolError => plain(&text, Style::default().fg(Color::Red)),
         LineKind::Thinking => plain(
-            &tl.text,
+            &text,
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
         ),
-        LineKind::System => plain(&tl.text, Style::default().fg(Color::DarkGray)),
-        LineKind::Note => plain(&tl.text, Style::default().fg(Color::Cyan)),
+        LineKind::System => plain(&text, Style::default().fg(Color::DarkGray)),
+        LineKind::Note => plain(&text, Style::default().fg(Color::Cyan)),
         LineKind::Approval => plain(
-            &tl.text,
+            &text,
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
     }
@@ -1633,6 +1660,28 @@ fn pane_indicator(view: &AgentView, tick: u64, elapsed_secs: Option<u64>) -> (St
 mod tests {
     use super::*;
     use awm_proto::{AgentInfo, AgentMeta, TokenUsage};
+
+    #[test]
+    fn sanitize_expands_tabs_and_drops_controls() {
+        // Tab → 4 spaces; ESC / CR / other C0 dropped; newline kept.
+        assert_eq!(sanitize_tui_text("a\tb"), "a    b");
+        assert_eq!(sanitize_tui_text("x\x1b[31my\r"), "x[31my");
+        assert_eq!(sanitize_tui_text("keep\nrows"), "keep\nrows");
+        assert!(!sanitize_tui_text("\x07\x08\x1b\r").chars().any(|c| c.is_control()));
+    }
+
+    #[test]
+    fn transcript_line_is_control_free_and_split_into_rows() {
+        // A tool-result run with a tab, a CR, and an embedded newline must render
+        // as two clean rows with no control chars that could spill past a border.
+        let tl = TranscriptLine::new(LineKind::ToolResult, "a\tb\rc\nsecond");
+        let rows: Vec<String> = render_transcript_line(&tl, 80)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+        assert_eq!(rows, vec!["a    bc".to_string(), "second".to_string()]);
+        assert!(rows.iter().all(|r| !r.chars().any(|c| c.is_control())));
+    }
     use ratatui::backend::TestBackend;
 
     /// Render the `TestBackend` buffer to plain text for a stable snapshot.
